@@ -1,0 +1,7 @@
+/build/
+*.log
+*.pdb
+*.ilk
+*.exp
+*.lib
+.vs/

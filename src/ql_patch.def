@@ -1,0 +1,12 @@
+LIBRARY ql_fps_patch
+EXPORTS
+    ql_patch_bootstrap
+    ql_patch_status
+    ql_patch_reason
+    ql_patch_engine_hash
+    ql_patch_cgame_hash
+    ql_patch_config_enabled
+    ql_patch_live_unload_refused
+    ql_patch_safetyhook_bound
+    ql_patch_measured_present_fps
+    ql_patch_measured_simulation_hz
