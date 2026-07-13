@@ -4,7 +4,10 @@
 
 #include <safetyhook.hpp>
 
+#include "hitreg_state.hpp"
+
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -52,6 +55,15 @@ constexpr std::uintptr_t k_cgame_predict_compare = 0x10044884U;
 constexpr std::uintptr_t k_cgame_warning_entry = 0x1000AEF0U;
 constexpr std::uintptr_t k_cgame_predict_entry = 0x100446E0U;
 constexpr std::uintptr_t k_cgame_fps_value = 0x10009C83U;
+constexpr std::uintptr_t k_cgame_hitreg_fire = 0x10006083U;
+constexpr std::uintptr_t k_cgame_hitreg_feedback = 0x100435CBU;
+constexpr std::uintptr_t k_cgame_hitreg_draw = 0x10009D3BU;
+constexpr std::uintptr_t k_cgame_angle_vectors = 0x10056E40U;
+constexpr std::uintptr_t k_cgame_point_trace = 0x10044040U;
+constexpr std::uintptr_t k_cgame_text_measure = 0x100082B0U;
+constexpr std::uintptr_t k_cgame_text_paint = 0x10008440U;
+constexpr std::uintptr_t k_cgame_client_info_teams = 0x10A41DF8U;
+constexpr std::uintptr_t k_cgame_serverinfo_flags = 0x10A3FF28U;
 constexpr std::uintptr_t k_cgame_replay_return = 0x10044953U;
 constexpr std::uintptr_t k_cgame_warning_absolute = 0x10075000U;
 constexpr std::uintptr_t k_cgame_fps_absolute = 0x10ABAF8CU;
@@ -80,10 +92,25 @@ constexpr std::array<std::uint8_t, 6> k_predict_entry_signature{
     0x81, 0xEC, 0xB4, 0x02, 0x00, 0x00};
 constexpr std::array<std::uint8_t, 8> k_fps_value_signature{
     0x53, 0x56, 0x8B, 0x35, 0x8C, 0xAF, 0xAB, 0x10};
+constexpr std::array<std::uint8_t, 5> k_hitreg_fire_signature{
+    0xE8, 0x38, 0xBF, 0xFF, 0xFF};
+constexpr std::array<std::uint8_t, 19> k_hitreg_feedback_signature{
+    0x8B, 0x86, 0x04, 0x01, 0x00, 0x00, 0x8B, 0x8D, 0x04, 0x01,
+    0x00, 0x00, 0x3B, 0xC1, 0x0F, 0x8E, 0xE0, 0x00, 0x00};
+constexpr std::array<std::uint8_t, 9> k_hitreg_draw_signature{
+    0x83, 0xC4, 0x24, 0x5F, 0x5E, 0x5B, 0xDB, 0x44, 0x24};
+constexpr std::array<std::uint8_t, 3> k_text_measure_signature{0x83, 0xEC, 0x20};
+constexpr std::array<std::uint8_t, 3> k_text_paint_signature{0x83, 0xEC, 0x24};
+constexpr std::array<std::uint8_t, 9> k_angle_vectors_signature{
+    0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8, 0x83, 0xEC, 0x08};
 
 constexpr std::size_t k_record_size = 28U;
 constexpr std::size_t k_history_capacity = 4096U;
 constexpr std::size_t k_history_warmup = 64U;
+constexpr std::size_t k_usercmd_buttons_offset = 16U;
+constexpr std::int32_t k_button_attack = 1;
+constexpr std::size_t k_client_info_stride = 0x738U;
+constexpr std::size_t k_trace_entity_number_index = 13U;
 
 enum : LONG {
     k_stock = 0,
@@ -115,6 +142,10 @@ using DisconnectFn = void(__cdecl*)(int);
 using VmLoaderFn = void*(__cdecl*)(const char*, void*, void*, int*);
 using CgameEntryFn = void(__cdecl*)();
 using ShutdownFn = void(__cdecl*)();
+using TextPaintFn = void(__cdecl*)(float, float, int, float, const float*, const char*, float,
+                                   int, int);
+using PointTraceFn = void(__cdecl*)(std::uint32_t*, const float*, const float*, const float*,
+                                    const float*, std::int32_t, std::int32_t);
 
 struct ReplayAuthorization {
     unsigned char active{};
@@ -146,7 +177,7 @@ volatile LONG g_measured_present_fps{};
 volatile LONG g_measured_simulation_hz{};
 volatile LONG64 g_present_count{};
 volatile LONG64 g_simulation_count{};
-const char* g_reason = "not_started";
+std::atomic<const char*> g_reason{"not_started"};
 std::array<char, 65> g_engine_hash{};
 std::array<char, 65> g_cgame_hash{};
 
@@ -177,11 +208,22 @@ safetyhook::InlineHook* g_predict_entry{};
 safetyhook::MidHook* g_warning{};
 safetyhook::MidHook* g_predict{};
 safetyhook::MidHook* g_fps_display{};
+safetyhook::MidHook* g_hitreg_fire{};
+safetyhook::MidHook* g_hitreg_feedback{};
+safetyhook::MidHook* g_hitreg_draw{};
 
 SRWLOCK g_history_lock = SRWLOCK_INIT;
 SRWLOCK g_decision_lock = SRWLOCK_INIT;
 SRWLOCK g_module_lock = SRWLOCK_INIT;
 SRWLOCK g_cgame_gate = SRWLOCK_INIT;
+SRWLOCK g_hitreg_lock = SRWLOCK_INIT;
+ql1k::HitregState g_hitreg_state{};
+volatile LONG64 g_hitreg_trace_total{};
+volatile LONG64 g_hitreg_trace_player{};
+volatile LONG64 g_hitreg_trace_world{};
+volatile LONG64 g_hitreg_trace_none{};
+volatile LONG64 g_hitreg_trace_other{};
+volatile LONG g_hitreg_trace_last_entity{-1};
 std::array<AuxiliaryRecord, k_history_capacity> g_history{};
 std::size_t g_history_head{};
 std::size_t g_history_size{};
@@ -203,6 +245,26 @@ __declspec(thread) LONG g_module_ticket_depth{};
 bool attach_cgame_hooks();
 bool detach_cgame_hooks();
 
+void reset_hitreg() {
+    AcquireSRWLockExclusive(&g_hitreg_lock);
+    g_hitreg_state.reset();
+    ReleaseSRWLockExclusive(&g_hitreg_lock);
+    InterlockedExchange64(&g_hitreg_trace_total, 0);
+    InterlockedExchange64(&g_hitreg_trace_player, 0);
+    InterlockedExchange64(&g_hitreg_trace_world, 0);
+    InterlockedExchange64(&g_hitreg_trace_none, 0);
+    InterlockedExchange64(&g_hitreg_trace_other, 0);
+    InterlockedExchange(&g_hitreg_trace_last_entity, -1);
+}
+
+void record_hitreg_usercmd(const AuxiliaryRecord& record) {
+    std::int32_t buttons{};
+    std::memcpy(&buttons, record.bytes.data() + k_usercmd_buttons_offset, sizeof(buttons));
+    AcquireSRWLockExclusive(&g_hitreg_lock);
+    g_hitreg_state.on_usercmd(record.server_time, (buttons & k_button_attack) != 0);
+    ReleaseSRWLockExclusive(&g_hitreg_lock);
+}
+
 BOOL CALLBACK find_game_window(HWND window, LPARAM result) {
     DWORD process_id{};
     GetWindowThreadProcessId(window, &process_id);
@@ -212,6 +274,52 @@ BOOL CALLBACK find_game_window(HWND window, LPARAM result) {
         return FALSE;
     }
     return TRUE;
+}
+
+const char* hitreg_kind_name(const ql1k::HitregDisplayKind kind) noexcept {
+    switch (kind) {
+        case ql1k::HitregDisplayKind::none:
+            return "none";
+        case ql1k::HitregDisplayKind::percent:
+            return "percent";
+        case ql1k::HitregDisplayKind::infinity:
+            return "infinity";
+        case ql1k::HitregDisplayKind::unavailable:
+            return "unavailable";
+    }
+    return "unknown";
+}
+
+const char* client_accuracy_kind_name(const ql1k::ClientAccuracyDisplayKind kind) noexcept {
+    switch (kind) {
+        case ql1k::ClientAccuracyDisplayKind::none:
+            return "none";
+        case ql1k::ClientAccuracyDisplayKind::percent:
+            return "percent";
+        case ql1k::ClientAccuracyDisplayKind::unavailable:
+            return "unavailable";
+    }
+    return "unknown";
+}
+
+const char* hitreg_reason_name(const ql1k::HitregUnavailableReason reason) noexcept {
+    switch (reason) {
+        case ql1k::HitregUnavailableReason::none:
+            return "none";
+        case ql1k::HitregUnavailableReason::inflight_hold_capacity:
+            return "inflight_hold_capacity";
+        case ql1k::HitregUnavailableReason::pending_tick_capacity:
+            return "pending_tick_capacity";
+        case ql1k::HitregUnavailableReason::multiple_ticks_before_first_trace:
+            return "multiple_ticks_before_first_trace";
+        case ql1k::HitregUnavailableReason::cross_hold_feedback:
+            return "cross_hold_feedback";
+        case ql1k::HitregUnavailableReason::unresolved_trace_on_close:
+            return "unresolved_trace_on_close";
+        case ql1k::HitregUnavailableReason::client_ray_unavailable:
+            return "client_ray_unavailable";
+    }
+    return "unknown";
 }
 
 DWORD WINAPI telemetry_worker(void*) noexcept {
@@ -255,11 +363,73 @@ DWORD WINAPI telemetry_worker(void*) noexcept {
         previous_presents = presents;
         previous_simulation = simulation;
 
-        char line[256]{};
-        const int bytes = sprintf_s(line, "measured_present_fps=%ld simulation_hz=%ld status=%ld reason=%s\r\n",
-                                    fps, sim_hz, InterlockedCompareExchange(&g_status, 0, 0),
-                                    g_reason == nullptr ? "unknown" : g_reason);
-        if (length != 0 && bytes > 0) {
+        ql1k::HitregDisplay hitreg{};
+        ql1k::HitregDiagnostics hitreg_diagnostics{};
+        AcquireSRWLockShared(&g_hitreg_lock);
+        hitreg = g_hitreg_state.published();
+        hitreg_diagnostics = g_hitreg_state.diagnostics();
+        ReleaseSRWLockShared(&g_hitreg_lock);
+        const char* const runtime_reason = g_reason.load(std::memory_order_acquire);
+
+        // This record intentionally carries both immutable hold data and
+        // session diagnostics. Never let a future field addition turn
+        // telemetry truncation into the CRT invalid-parameter process abort.
+        char line[1536]{};
+        const int formatted_bytes = _snprintf_s(
+            line, sizeof(line), _TRUNCATE,
+            "measured_present_fps=%ld simulation_hz=%ld status=%ld reason=%s "
+            "client_accuracy_kind=%s client_accuracy_percent_hundredths=%lu "
+            "client_accuracy_hits=%lu client_accuracy_opportunities=%lu "
+            "hitreg_generation=%llu hitreg_kind=%s hitreg_percent_hundredths=%lu "
+            "hitreg_client=%lu "
+            "hitreg_server=%lu hitreg_samples=%lu hitreg_fire_events=%lu "
+            "hitreg_hold_start=%ld hitreg_hold_end=%ld "
+            "hitreg_hold_trace_total=%lu hitreg_hold_trace_player=%lu "
+            "hitreg_hold_trace_world=%lu hitreg_hold_trace_none=%lu "
+            "hitreg_hold_trace_other=%lu hitreg_hold_trace_client_player=%lu "
+            "hitreg_pending_holds=%zu "
+            "hitreg_pending_ticks=%zu hitreg_pending_client=%lu hitreg_hold_open=%u "
+            "hitreg_unavailable_reason=%s hitreg_session_feedback_seen=%lu "
+            "hitreg_session_feedback_assigned=%lu hitreg_session_feedback_unowned=%lu "
+            "hitreg_session_trace_total=%lld hitreg_session_trace_player=%lld "
+            "hitreg_session_trace_world=%lld hitreg_session_trace_none=%lld "
+            "hitreg_session_trace_other=%lld hitreg_session_trace_last=%ld\r\n",
+            fps, sim_hz, InterlockedCompareExchange(&g_status, 0, 0),
+            runtime_reason == nullptr ? "unknown" : runtime_reason,
+            client_accuracy_kind_name(hitreg.client_accuracy_kind),
+            static_cast<unsigned long>(hitreg.client_accuracy_percent_hundredths),
+            static_cast<unsigned long>(hitreg.client_accuracy_hits),
+            static_cast<unsigned long>(hitreg.client_accuracy_opportunities),
+            static_cast<unsigned long long>(hitreg.generation), hitreg_kind_name(hitreg.kind),
+            static_cast<unsigned long>(hitreg.percent_hundredths),
+            static_cast<unsigned long>(hitreg.client_hits),
+            static_cast<unsigned long>(hitreg.server_hits),
+            static_cast<unsigned long>(hitreg.samples),
+            static_cast<unsigned long>(hitreg.fire_events), hitreg.start_time, hitreg.end_time,
+            static_cast<unsigned long>(hitreg.trace_total),
+            static_cast<unsigned long>(hitreg.trace_player),
+            static_cast<unsigned long>(hitreg.trace_world),
+            static_cast<unsigned long>(hitreg.trace_none),
+            static_cast<unsigned long>(hitreg.trace_other),
+            static_cast<unsigned long>(hitreg.trace_client_player),
+            hitreg_diagnostics.pending_holds,
+            hitreg_diagnostics.pending_server_ticks,
+            static_cast<unsigned long>(hitreg_diagnostics.pending_client_samples),
+            hitreg_diagnostics.hold_open ? 1U : 0U,
+            hitreg_reason_name(hitreg.unavailable_reason),
+            static_cast<unsigned long>(hitreg_diagnostics.feedback_positive_seen),
+            static_cast<unsigned long>(hitreg_diagnostics.feedback_positive_assigned),
+            static_cast<unsigned long>(hitreg_diagnostics.feedback_positive_unowned),
+            static_cast<long long>(InterlockedCompareExchange64(&g_hitreg_trace_total, 0, 0)),
+            static_cast<long long>(InterlockedCompareExchange64(&g_hitreg_trace_player, 0, 0)),
+            static_cast<long long>(InterlockedCompareExchange64(&g_hitreg_trace_world, 0, 0)),
+            static_cast<long long>(InterlockedCompareExchange64(&g_hitreg_trace_none, 0, 0)),
+            static_cast<long long>(InterlockedCompareExchange64(&g_hitreg_trace_other, 0, 0)),
+            InterlockedCompareExchange(&g_hitreg_trace_last_entity, 0, 0));
+        const std::size_t bytes = formatted_bytes >= 0
+                                      ? static_cast<std::size_t>(formatted_bytes)
+                                      : strnlen_s(line, sizeof(line));
+        if (length != 0 && bytes != 0) {
             const HANDLE file = CreateFileW(log_path, GENERIC_WRITE,
                                             FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -473,7 +643,7 @@ void mark_permanent_fault(const char* reason) {
     InterlockedExchange(&g_runtime_armed, 0);
     InterlockedExchange(&g_status, k_refused);
     if (reason != nullptr) {
-        g_reason = reason;
+        g_reason.store(reason, std::memory_order_release);
     }
 }
 
@@ -524,6 +694,7 @@ bool begin_transition() {
     InterlockedExchange(&g_transition_pending, 1);
     InterlockedExchange(&g_history_active, 0);
     ReleaseSRWLockExclusive(&g_history_lock);
+    reset_hitreg();
     return true;
 }
 
@@ -613,6 +784,7 @@ void release_module_ticket() {
 }
 
 void initialize_history(const std::int32_t baseline) {
+    reset_hitreg();
     AcquireSRWLockExclusive(&g_history_lock);
     clear_history_locked();
     g_capture_cursor = baseline;
@@ -670,6 +842,7 @@ bool append_published_record(const std::int32_t old_command,
         InterlockedExchange(&g_history_fault, 0);
         InterlockedExchange(&g_history_active, 0);
         ReleaseSRWLockExclusive(&g_history_lock);
+        reset_hitreg();
         return true;
     }
     if (!g_history_have_last) {
@@ -691,6 +864,7 @@ bool append_published_record(const std::int32_t old_command,
         InterlockedExchange(&g_history_active, 1);
     }
     ReleaseSRWLockExclusive(&g_history_lock);
+    record_hitreg_usercmd(record);
     return true;
 }
 
@@ -969,7 +1143,8 @@ void* __cdecl vm_loader_hook(const char* name, void* interface_table, void* call
                 } else {
                     initialize_history(*command_number_ptr);
                     InterlockedExchange(&g_runtime_armed, 1);
-                    g_reason = "runtime_candidate_active_unverified";
+                    g_reason.store("runtime_candidate_active_unverified",
+                                   std::memory_order_release);
                 }
             }
         }
@@ -1211,6 +1386,258 @@ void fps_display_hook(safetyhook::Context& context) {
     }
 }
 
+__declspec(noinline) float native_scaled_add(const float base, const float value,
+                                             const double scale) noexcept {
+    float result{};
+    __asm {
+        fld dword ptr [value]
+        fmul qword ptr [scale]
+        fadd dword ptr [base]
+        fstp dword ptr [result]
+    }
+    return result;
+}
+
+bool native_angle_vectors(const float* angles, float* forward) noexcept {
+    const auto function = cgame_address(k_cgame_angle_vectors);
+    if (function == nullptr || angles == nullptr || forward == nullptr) {
+        return false;
+    }
+    __asm {
+        push ebx
+        push esi
+        push edi
+        mov esi, angles
+        mov edi, forward
+        xor ebx, ebx
+        push 0
+        mov eax, function
+        call eax
+        add esp, 4
+        pop edi
+        pop esi
+        pop ebx
+    }
+    return true;
+}
+
+struct ClientRayResult {
+    ql1k::HitregTraceKind kind{ql1k::HitregTraceKind::other};
+    std::int32_t entity_number{-1};
+    bool opponent_contact{};
+    bool available{};
+};
+
+ClientRayResult trace_native_client_lg_ray(const std::uint8_t* player_state) noexcept {
+    ClientRayResult result{};
+    const auto trace = reinterpret_cast<PointTraceFn>(cgame_address(k_cgame_point_trace));
+    const auto* const serverinfo_flags =
+        static_cast<const std::int32_t*>(cgame_address(k_cgame_serverinfo_flags));
+    if (player_state == nullptr || trace == nullptr || serverinfo_flags == nullptr) {
+        return result;
+    }
+    const std::int32_t shooter =
+        *reinterpret_cast<const std::int32_t*>(player_state + 0x88U);
+    if (shooter < 0 || shooter >= 64) {
+        return result;
+    }
+
+    std::array<float, 3> angles{};
+    std::array<float, 3> forward{};
+    std::array<float, 3> origin{};
+    std::memcpy(angles.data(), player_state + 0xA0U, sizeof(angles));
+    std::memcpy(origin.data(), player_state + 0x14U, sizeof(origin));
+    if (!native_angle_vectors(angles.data(), forward.data())) {
+        return result;
+    }
+
+    const auto pm_flags = *reinterpret_cast<const std::int32_t*>(player_state + 0x0CU);
+    const auto viewheight = *reinterpret_cast<const std::int32_t*>(player_state + 0xACU);
+    const double muzzle_offset = (pm_flags & 1) != 0 ? 3.0 : 5.0;
+    std::array<float, 3> start{};
+    for (std::size_t axis = 0; axis < start.size(); ++axis) {
+        const float snapped = static_cast<float>(static_cast<std::int32_t>(origin[axis]));
+        const float base = axis == 2U ? snapped + static_cast<float>(viewheight) : snapped;
+        start[axis] = native_scaled_add(base, forward[axis], muzzle_offset);
+    }
+    std::array<float, 3> end{};
+    for (std::size_t axis = 0; axis < end.size(); ++axis) {
+        end[axis] = native_scaled_add(start[axis], forward[axis], 768.0);
+    }
+
+    std::array<std::uint32_t, 14> trace_result{};
+    const std::int32_t mask = (*serverinfo_flags & 0x02000000) != 0 ? 0x00000001 : 0x06000001;
+    trace(trace_result.data(), start.data(), nullptr, nullptr, end.data(), shooter, mask);
+    std::memcpy(&result.entity_number,
+                trace_result.data() + k_trace_entity_number_index,
+                sizeof(result.entity_number));
+
+    bool opponent = result.entity_number >= 0 && result.entity_number < 64 &&
+                    result.entity_number != shooter;
+    if (opponent) {
+        const auto* const teams =
+            static_cast<const std::uint8_t*>(cgame_address(k_cgame_client_info_teams));
+        if (teams == nullptr) {
+            return result;
+        } else {
+            std::int32_t local_team{};
+            std::int32_t candidate_team{};
+            std::memcpy(&local_team,
+                        teams + static_cast<std::size_t>(shooter) * k_client_info_stride,
+                        sizeof(local_team));
+            std::memcpy(&candidate_team,
+                        teams + static_cast<std::size_t>(result.entity_number) *
+                                    k_client_info_stride,
+                        sizeof(candidate_team));
+            opponent = ql1k::hitreg_is_opponent(local_team, candidate_team);
+        }
+    }
+    result.opponent_contact = opponent;
+    result.kind = opponent                    ? ql1k::HitregTraceKind::player
+                  : result.entity_number == 1022 ? ql1k::HitregTraceKind::world
+                  : result.entity_number == 1023 ? ql1k::HitregTraceKind::none
+                                                 : ql1k::HitregTraceKind::other;
+    result.available = true;
+    return result;
+}
+
+void hitreg_fire_hook(safetyhook::Context& context) {
+    if (InterlockedCompareExchange(&g_runtime_armed, 0, 0) == 0 || context.esi == 0 ||
+        context.edx != 0x14U) {
+        return;
+    }
+    const auto* const player_state =
+        *reinterpret_cast<const std::uint8_t* const*>(context.esi);
+    if (player_state == nullptr) {
+        return;
+    }
+
+    const std::int32_t command_time = *reinterpret_cast<const std::int32_t*>(player_state);
+    const std::int32_t weapon = *reinterpret_cast<const std::int32_t*>(player_state + 0x90U);
+    AcquireSRWLockExclusive(&g_hitreg_lock);
+    if (!g_hitreg_state.wants_client_ray(weapon, command_time)) {
+        g_hitreg_state.on_weapon_fire(
+            weapon, command_time, ql1k::HitregTraceKind::other, false, true);
+        ReleaseSRWLockExclusive(&g_hitreg_lock);
+        return;
+    }
+    const ClientRayResult ray = trace_native_client_lg_ray(player_state);
+    if (ray.available) {
+        InterlockedIncrement64(&g_hitreg_trace_total);
+        InterlockedExchange(&g_hitreg_trace_last_entity, ray.entity_number);
+        if (ray.kind == ql1k::HitregTraceKind::player) {
+            InterlockedIncrement64(&g_hitreg_trace_player);
+        } else if (ray.kind == ql1k::HitregTraceKind::world) {
+            InterlockedIncrement64(&g_hitreg_trace_world);
+        } else if (ray.kind == ql1k::HitregTraceKind::none) {
+            InterlockedIncrement64(&g_hitreg_trace_none);
+        } else {
+            InterlockedIncrement64(&g_hitreg_trace_other);
+        }
+    }
+    g_hitreg_state.on_weapon_fire(weapon, command_time, ray.kind, ray.opponent_contact,
+                                  ray.available);
+    ReleaseSRWLockExclusive(&g_hitreg_lock);
+}
+
+void hitreg_feedback_hook(safetyhook::Context& context) {
+    if (InterlockedCompareExchange(&g_runtime_armed, 0, 0) == 0 || context.esi == 0 ||
+        context.ebp == 0) {
+        return;
+    }
+    const auto* const new_player_state = reinterpret_cast<const std::uint8_t*>(context.esi);
+    const auto* const old_player_state = reinterpret_cast<const std::uint8_t*>(context.ebp);
+    const std::int32_t new_command_time =
+        *reinterpret_cast<const std::int32_t*>(new_player_state);
+    const std::int32_t old_command_time =
+        *reinterpret_cast<const std::int32_t*>(old_player_state);
+    const std::int32_t new_hits =
+        *reinterpret_cast<const std::int32_t*>(new_player_state + 0x104U);
+    const std::int32_t old_hits =
+        *reinterpret_cast<const std::int32_t*>(old_player_state + 0x104U);
+    AcquireSRWLockExclusive(&g_hitreg_lock);
+    // PERS_HITS is accumulated damage. Its magnitude changes with server weapon
+    // settings, so HitregState consumes only its positive/negative hit-beep signal.
+    g_hitreg_state.on_server_feedback_transition(
+        old_command_time, new_command_time, old_hits, new_hits);
+    ReleaseSRWLockExclusive(&g_hitreg_lock);
+}
+
+bool measure_hitreg_text(const char* const text, const float scale, const int font,
+                         int& width, int& height) {
+    const auto measure = cgame_address(k_cgame_text_measure);
+    if (measure == nullptr || text == nullptr) {
+        return false;
+    }
+    width = 0;
+    height = 0;
+    int* const width_output = &width;
+    int* const height_output = &height;
+    __asm {
+        mov ecx, text
+        xor edx, edx
+        mov esi, width_output
+        xor edi, edi
+        push scale
+        push font
+        call measure
+        add esp, 8
+        mov ecx, text
+        xor edx, edx
+        xor esi, esi
+        mov edi, height_output
+        push scale
+        push font
+        call measure
+        add esp, 8
+    }
+    return width > 0 && height > 0;
+}
+
+void hitreg_draw_hook(safetyhook::Context& context) {
+    if (InterlockedCompareExchange(&g_runtime_armed, 0, 0) == 0 || context.esp == 0) {
+        return;
+    }
+
+    ql1k::HitregDisplay display{};
+    std::size_t pending_holds = 0;
+    AcquireSRWLockShared(&g_hitreg_lock);
+    display = g_hitreg_state.published();
+    pending_holds = g_hitreg_state.pending_holds();
+    ReleaseSRWLockShared(&g_hitreg_lock);
+    if (display.client_accuracy_kind == ql1k::ClientAccuracyDisplayKind::none ||
+        pending_holds != 0) {
+        return;
+    }
+
+    char text[32]{};
+    ql1k::format_hitreg_text(display, text, sizeof(text));
+
+    const auto* const arguments = reinterpret_cast<const std::uint32_t*>(context.esp);
+    float source_y{};
+    float scale{};
+    float adjust{};
+    std::memcpy(&source_y, &arguments[1], sizeof(source_y));
+    std::memcpy(&scale, &arguments[3], sizeof(scale));
+    std::memcpy(&adjust, &arguments[6], sizeof(adjust));
+    const int font = static_cast<int>(arguments[2]);
+    int width{};
+    int height{};
+    if (!measure_hitreg_text(text, scale, font, width, height)) {
+        return;
+    }
+
+    const auto paint = reinterpret_cast<TextPaintFn>(cgame_address(k_cgame_text_paint));
+    const auto* const color = reinterpret_cast<const float*>(arguments[4]);
+    if (paint == nullptr || color == nullptr) {
+        return;
+    }
+    constexpr float k_stock_fps_right_edge = 635.0F;
+    paint(k_stock_fps_right_edge - static_cast<float>(width),
+          source_y + static_cast<float>(height), font, scale, color, text, adjust,
+          static_cast<int>(arguments[7]), static_cast<int>(arguments[8]));
+}
+
 template <typename T>
 T* move_to_heap(std::expected<T, typename T::Error>& result) {
     if (!result) {
@@ -1250,24 +1677,33 @@ bool detach_cgame_hooks() {
 
     destroy_candidate(g_predict);
     destroy_candidate(g_fps_display);
+    destroy_candidate(g_hitreg_draw);
+    destroy_candidate(g_hitreg_feedback);
+    destroy_candidate(g_hitreg_fire);
     destroy_candidate(g_warning);
     destroy_candidate(g_predict_entry);
     destroy_candidate(g_warning_entry);
     g_predict = nullptr;
     g_fps_display = nullptr;
+    g_hitreg_draw = nullptr;
+    g_hitreg_feedback = nullptr;
+    g_hitreg_fire = nullptr;
     g_warning = nullptr;
     g_predict_entry = nullptr;
     g_warning_entry = nullptr;
     g_stock_predict_entry = nullptr;
     g_stock_warning_entry = nullptr;
     g_replay_auth.active = 0;
+    reset_hitreg();
     return true;
 }
 
 bool attach_cgame_hooks() {
     AcquireSRWLockExclusive(&g_cgame_gate);
     if (g_cgame == nullptr || g_warning_entry != nullptr || g_predict_entry != nullptr ||
-        g_warning != nullptr || g_predict != nullptr || g_fps_display != nullptr) {
+        g_warning != nullptr || g_predict != nullptr || g_fps_display != nullptr ||
+        g_hitreg_fire != nullptr || g_hitreg_feedback != nullptr ||
+        g_hitreg_draw != nullptr) {
         ReleaseSRWLockExclusive(&g_cgame_gate);
         return false;
     }
@@ -1279,7 +1715,13 @@ bool attach_cgame_hooks() {
         !signature_matches(cgame_address(k_cgame_predict_compare), k_predict_signature) ||
         !relocated_absolute_signature_matches(cgame_address(k_cgame_fps_value),
                                                k_fps_value_signature, 4U,
-                                               cgame_address(k_cgame_fps_absolute))) {
+                                               cgame_address(k_cgame_fps_absolute)) ||
+        !signature_matches(cgame_address(k_cgame_hitreg_fire), k_hitreg_fire_signature) ||
+        !signature_matches(cgame_address(k_cgame_angle_vectors), k_angle_vectors_signature) ||
+        !signature_matches(cgame_address(k_cgame_hitreg_feedback), k_hitreg_feedback_signature) ||
+        !signature_matches(cgame_address(k_cgame_hitreg_draw), k_hitreg_draw_signature) ||
+        !signature_matches(cgame_address(k_cgame_text_measure), k_text_measure_signature) ||
+        !signature_matches(cgame_address(k_cgame_text_paint), k_text_paint_signature)) {
         ReleaseSRWLockExclusive(&g_cgame_gate);
         return false;
     }
@@ -1299,18 +1741,34 @@ bool attach_cgame_hooks() {
     auto fps_result = safetyhook::MidHook::create(
         cgame_address(k_cgame_fps_value), &fps_display_hook,
         safetyhook::MidHook::StartDisabled);
+    auto hitreg_fire_result = safetyhook::MidHook::create(
+        cgame_address(k_cgame_hitreg_fire), &hitreg_fire_hook,
+        safetyhook::MidHook::StartDisabled);
+    auto hitreg_feedback_result = safetyhook::MidHook::create(
+        cgame_address(k_cgame_hitreg_feedback), &hitreg_feedback_hook,
+        safetyhook::MidHook::StartDisabled);
+    auto hitreg_draw_result = safetyhook::MidHook::create(
+        cgame_address(k_cgame_hitreg_draw), &hitreg_draw_hook,
+        safetyhook::MidHook::StartDisabled);
     auto* entry1 = move_to_heap(entry1_result);
     auto* entry2 = move_to_heap(entry2_result);
     auto* warning = move_to_heap(warning_result);
     auto* predict = move_to_heap(predict_result);
     auto* fps = move_to_heap(fps_result);
+    auto* hitreg_fire = move_to_heap(hitreg_fire_result);
+    auto* hitreg_feedback = move_to_heap(hitreg_feedback_result);
+    auto* hitreg_draw = move_to_heap(hitreg_draw_result);
     if (entry1 == nullptr || entry2 == nullptr || warning == nullptr || predict == nullptr ||
-        fps == nullptr) {
+        fps == nullptr || hitreg_fire == nullptr || hitreg_feedback == nullptr ||
+        hitreg_draw == nullptr) {
         destroy_candidate(entry1);
         destroy_candidate(entry2);
         destroy_candidate(warning);
         destroy_candidate(predict);
         destroy_candidate(fps);
+        destroy_candidate(hitreg_fire);
+        destroy_candidate(hitreg_feedback);
+        destroy_candidate(hitreg_draw);
         ReleaseSRWLockExclusive(&g_cgame_gate);
         return false;
     }
@@ -1319,15 +1777,20 @@ bool attach_cgame_hooks() {
     g_warning = warning;
     g_predict = predict;
     g_fps_display = fps;
+    g_hitreg_fire = hitreg_fire;
+    g_hitreg_feedback = hitreg_feedback;
+    g_hitreg_draw = hitreg_draw;
     g_stock_warning_entry = entry1->original<CgameEntryFn>();
     g_stock_predict_entry = entry2->original<CgameEntryFn>();
     if (!entry1->enable().has_value() || !entry2->enable().has_value() ||
         !warning->enable().has_value() || !predict->enable().has_value() ||
-        !fps->enable().has_value()) {
+        !fps->enable().has_value() || !hitreg_fire->enable().has_value() ||
+        !hitreg_feedback->enable().has_value() || !hitreg_draw->enable().has_value()) {
         (void)detach_cgame_hooks();
         ReleaseSRWLockExclusive(&g_cgame_gate);
         return false;
     }
+    reset_hitreg();
     ReleaseSRWLockExclusive(&g_cgame_gate);
     return true;
 }
@@ -1338,7 +1801,7 @@ bool install_runtime_hooks() {
         if (signature_matches(address, expected)) {
             return true;
         }
-        g_reason = reason;
+        g_reason.store(reason, std::memory_order_release);
         return false;
     };
     const auto check_relocated_signature = [](const void* address, const auto& expected,
@@ -1349,7 +1812,7 @@ bool install_runtime_hooks() {
                                                  relocated_target)) {
             return true;
         }
-        g_reason = reason;
+        g_reason.store(reason, std::memory_order_release);
         return false;
     };
     if (!check_signature(engine_address(k_engine_s1), k_s1_signature,
@@ -1389,14 +1852,26 @@ bool install_runtime_hooks() {
                          "hook_signature_mismatch_predict_compare") ||
         !check_relocated_signature(cgame_address(k_cgame_fps_value), k_fps_value_signature, 4U,
                                    cgame_address(k_cgame_fps_absolute),
-                                   "hook_signature_mismatch_fps_value")) {
+                                   "hook_signature_mismatch_fps_value") ||
+        !check_signature(cgame_address(k_cgame_hitreg_fire), k_hitreg_fire_signature,
+                         "hook_signature_mismatch_hitreg_fire") ||
+        !check_signature(cgame_address(k_cgame_angle_vectors), k_angle_vectors_signature,
+                         "hook_signature_mismatch_angle_vectors") ||
+        !check_signature(cgame_address(k_cgame_hitreg_feedback), k_hitreg_feedback_signature,
+                         "hook_signature_mismatch_hitreg_feedback") ||
+        !check_signature(cgame_address(k_cgame_hitreg_draw), k_hitreg_draw_signature,
+                         "hook_signature_mismatch_hitreg_draw") ||
+        !check_signature(cgame_address(k_cgame_text_measure), k_text_measure_signature,
+                         "hook_signature_mismatch_text_measure") ||
+        !check_signature(cgame_address(k_cgame_text_paint), k_text_paint_signature,
+                         "hook_signature_mismatch_text_paint")) {
         return false;
     }
 
     HMODULE pinned_patch{};
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
                             reinterpret_cast<LPCWSTR>(&__ImageBase), &pinned_patch)) {
-        g_reason = "patch_pin_failed";
+        g_reason.store("patch_pin_failed", std::memory_order_release);
         return false;
     }
     (void)pinned_patch;
@@ -1404,13 +1879,13 @@ bool install_runtime_hooks() {
     auto* slot = reinterpret_cast<void* volatile*>(engine_address(k_engine_getter_slot));
     const auto stock_getter = engine_address(k_engine_stock_getter);
     if (slot == nullptr || stock_getter == nullptr) {
-        g_reason = "getter_slot_unresolved";
+        g_reason.store("getter_slot_unresolved", std::memory_order_release);
         return false;
     }
 
     void* existing = *slot;
     if (existing != stock_getter && existing != reinterpret_cast<void*>(&get_usercmd_hook)) {
-        g_reason = "getter_slot_owner_changed";
+        g_reason.store("getter_slot_owner_changed", std::memory_order_release);
         return false;
     }
     g_stock_getter = reinterpret_cast<GetterFn>(stock_getter);
@@ -1418,7 +1893,7 @@ bool install_runtime_hooks() {
     const auto* command_number_ptr =
         static_cast<const std::int32_t*>(engine_address(k_engine_cmd_number));
     if (command_number_ptr == nullptr) {
-        g_reason = "command_number_unresolved";
+        g_reason.store("command_number_unresolved", std::memory_order_release);
         return false;
     }
     initialize_history(*command_number_ptr);
@@ -1456,6 +1931,15 @@ bool install_runtime_hooks() {
     auto fps_result = safetyhook::MidHook::create(cgame_address(k_cgame_fps_value),
                                                   &fps_display_hook,
                                                   safetyhook::MidHook::StartDisabled);
+    auto hitreg_fire_result = safetyhook::MidHook::create(cgame_address(k_cgame_hitreg_fire),
+                                                          &hitreg_fire_hook,
+                                                          safetyhook::MidHook::StartDisabled);
+    auto hitreg_feedback_result = safetyhook::MidHook::create(
+        cgame_address(k_cgame_hitreg_feedback), &hitreg_feedback_hook,
+        safetyhook::MidHook::StartDisabled);
+    auto hitreg_draw_result = safetyhook::MidHook::create(cgame_address(k_cgame_hitreg_draw),
+                                                          &hitreg_draw_hook,
+                                                          safetyhook::MidHook::StartDisabled);
 
     auto* s1 = move_to_heap(s1_result);
     auto* s2 = move_to_heap(s2_result);
@@ -1471,10 +1955,14 @@ bool install_runtime_hooks() {
     auto* warning = move_to_heap(warning_result);
     auto* predict = move_to_heap(predict_result);
     auto* fps = move_to_heap(fps_result);
+    auto* hitreg_fire = move_to_heap(hitreg_fire_result);
+    auto* hitreg_feedback = move_to_heap(hitreg_feedback_result);
+    auto* hitreg_draw = move_to_heap(hitreg_draw_result);
     if (s1 == nullptr || s2 == nullptr || s3 == nullptr || s4 == nullptr || s8 == nullptr ||
         s9_pre == nullptr || s9_post == nullptr || s10 == nullptr || s11 == nullptr ||
         warning_entry == nullptr || predict_entry == nullptr || warning == nullptr ||
-        predict == nullptr || fps == nullptr) {
+        predict == nullptr || fps == nullptr || hitreg_fire == nullptr ||
+        hitreg_feedback == nullptr || hitreg_draw == nullptr) {
         destroy_candidate(s1);
         destroy_candidate(s2);
         destroy_candidate(s3);
@@ -1489,7 +1977,10 @@ bool install_runtime_hooks() {
         destroy_candidate(warning);
         destroy_candidate(predict);
         destroy_candidate(fps);
-        g_reason = "hook_create_failed";
+        destroy_candidate(hitreg_fire);
+        destroy_candidate(hitreg_feedback);
+        destroy_candidate(hitreg_draw);
+        g_reason.store("hook_create_failed", std::memory_order_release);
         return false;
     }
 
@@ -1507,6 +1998,9 @@ bool install_runtime_hooks() {
     g_warning = warning;
     g_predict = predict;
     g_fps_display = fps;
+    g_hitreg_fire = hitreg_fire;
+    g_hitreg_feedback = hitreg_feedback;
+    g_hitreg_draw = hitreg_draw;
     g_stock_delta = g_s2->original<DeltaFn>();
     g_stock_client_frame = g_s3->original<ClientFrameFn>();
     g_stock_publisher = g_s4->original<PublisherFn>();
@@ -1531,27 +2025,31 @@ bool install_runtime_hooks() {
     const bool e_warning = warning->enable().has_value();
     const bool e_predict = predict->enable().has_value();
     const bool e_fps = fps->enable().has_value();
+    const bool e_hitreg_fire = hitreg_fire->enable().has_value();
+    const bool e_hitreg_feedback = hitreg_feedback->enable().has_value();
+    const bool e_hitreg_draw = hitreg_draw->enable().has_value();
     const bool enabled = e1 && e2 && e3 && e4 && e8 && e9_pre && e9_post && e10 && e11 &&
-                         e_warning_entry && e_predict_entry && e_warning && e_predict && e_fps;
+                         e_warning_entry && e_predict_entry && e_warning && e_predict && e_fps &&
+                         e_hitreg_fire && e_hitreg_feedback && e_hitreg_draw;
     if (!enabled) {
         InterlockedExchange(&g_runtime_armed, 0);
         // Keep any partially enabled hooks resident for process life. All
         // callbacks are explicitly stock-only while runtime_armed is zero;
         // removing a live hook here would race a game thread and violate the
         // no-live-unhook lifecycle contract.
-        g_reason = "hook_enable_failed_pass_through";
+        g_reason.store("hook_enable_failed_pass_through", std::memory_order_release);
         return false;
     }
 
     if (!ensure_getter_slot()) {
         InterlockedExchange(&g_runtime_armed, 0);
-        g_reason = "getter_slot_install_failed_pass_through";
+        g_reason.store("getter_slot_install_failed_pass_through", std::memory_order_release);
         return false;
     }
 
     InterlockedExchange(&g_runtime_armed, 1);
     ensure_telemetry_worker();
-    g_reason = "runtime_candidate_active_unverified";
+    g_reason.store("runtime_candidate_active_unverified", std::memory_order_release);
     return true;
 }
 
@@ -1566,23 +2064,23 @@ bool try_install() {
     bool installed = false;
     g_config_enabled = configured_enabled() && configured_experimental() ? 1 : 0;
     if (g_config_enabled == 0) {
-        g_reason = "disabled_stock";
+        g_reason.store("disabled_stock", std::memory_order_release);
         InterlockedExchange(&g_status, k_stock);
     } else {
         g_engine = GetModuleHandleW(nullptr);
         g_cgame = GetModuleHandleW(L"cgamex86.dll");
         if (g_engine == nullptr || g_cgame == nullptr) {
-            g_reason = "waiting_for_engine_or_cgame";
+            g_reason.store("waiting_for_engine_or_cgame", std::memory_order_release);
             InterlockedExchange(&g_status, k_waiting_for_modules);
         } else if (!hash_file(module_path(g_engine), g_engine_hash) ||
                    !hash_file(module_path(g_cgame), g_cgame_hash)) {
-            g_reason = "module_hash_read_failed";
+            g_reason.store("module_hash_read_failed", std::memory_order_release);
             InterlockedExchange(&g_status, k_refused);
         } else if (!exact_hash(std::string_view(g_engine_hash.data()), k_engine_hash)) {
-            g_reason = "engine_identity_mismatch";
+            g_reason.store("engine_identity_mismatch", std::memory_order_release);
             InterlockedExchange(&g_status, k_refused);
         } else if (!exact_hash(std::string_view(g_cgame_hash.data()), k_cgame_hash)) {
-            g_reason = "cgame_identity_mismatch";
+            g_reason.store("cgame_identity_mismatch", std::memory_order_release);
             InterlockedExchange(&g_status, k_refused);
         } else {
             InterlockedExchange(&g_status, k_identity_validated);
@@ -1642,7 +2140,7 @@ extern "C" BOOL WINAPI ql_patch_bootstrap() noexcept {
     }
     g_config_enabled = configured_enabled() && configured_experimental() ? 1 : 0;
     if (g_config_enabled == 0) {
-        g_reason = "disabled_stock";
+        g_reason.store("disabled_stock", std::memory_order_release);
         InterlockedExchange(&g_status, k_stock);
         return FALSE;
     }
@@ -1663,7 +2161,9 @@ extern "C" LONG WINAPI ql_patch_measured_simulation_hz() noexcept {
     return InterlockedCompareExchange(&g_measured_simulation_hz, 0, 0);
 }
 
-extern "C" const char* WINAPI ql_patch_reason() noexcept { return g_reason; }
+extern "C" const char* WINAPI ql_patch_reason() noexcept {
+    return g_reason.load(std::memory_order_acquire);
+}
 
 extern "C" const char* WINAPI ql_patch_engine_hash() noexcept { return g_engine_hash.data(); }
 
