@@ -52,6 +52,10 @@ static_assert(!ql1k::persistent_wake_requires_ack(false, false));
 static_assert(ql1k::persistent_wake_requires_ack(true, false));
 static_assert(ql1k::persistent_wake_requires_ack(false, true));
 static_assert(ql1k::persistent_wake_requires_ack(true, true));
+static_assert(!ql1k::persistent_wake_requires_completion(false, false));
+static_assert(!ql1k::persistent_wake_requires_completion(true, false));
+static_assert(ql1k::persistent_wake_requires_completion(false, true));
+static_assert(!ql1k::persistent_wake_requires_completion(true, true));
 
 } // namespace
 

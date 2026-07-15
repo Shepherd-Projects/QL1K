@@ -31,6 +31,11 @@ inline constexpr long k_keycatch_ui = 2;
     return null_command || synchronous_requested;
 }
 
+[[nodiscard]] constexpr bool persistent_wake_requires_completion(
+    const bool null_command, const bool synchronous_requested) noexcept {
+    return !null_command && synchronous_requested;
+}
+
 [[nodiscard]] constexpr bool smp_context_protocol_active(const long state) noexcept {
     return state >= static_cast<long>(SmpContextState::renderer_owned) &&
            state <= static_cast<long>(SmpContextState::released_to_renderer);

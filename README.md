@@ -9,6 +9,14 @@ The safe release deliberately does **not** attempt sub-millisecond input or
 physics. Movement, mouse input, simulation, and command timing retain the
 game's integer-millisecond behavior.
 
+The production configuration uses zero-queued-frame persistent SMP. Mouse and
+keyboard state still enter through Quake Live's stock input and ~1 kHz command
+path, while each renderer command list is acknowledged before another frame is
+built. This removes the asynchronous one-frame render backlog without returning
+the OpenGL context to the main thread every frame. On the controlled reference
+demo, median presentation rate remained 2,585 FPS versus 3,957.5 FPS for the
+queued control.
+
 ## Important disclaimer
 
 Use this only against bots or on servers whose owners/rules explicitly allow

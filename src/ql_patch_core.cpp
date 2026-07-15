@@ -2775,6 +2775,9 @@ void __cdecl smp_wake_hook(void* data) {
         const bool wait_for_ack = ql1k::persistent_wake_requires_ack(
             data == nullptr,
             InterlockedCompareExchange(&g_config_smp_synchronous, 0, 0) != 0);
+        const bool wait_for_completion = ql1k::persistent_wake_requires_completion(
+            data == nullptr,
+            InterlockedCompareExchange(&g_config_smp_synchronous, 0, 0) != 0);
         // Producer ownership of renderer_idle closes the manual-reset-event
         // race: once the prior FrontEndSleep observed idle, the next command
         // makes it non-idle before publication. The worker sets it again only
@@ -2785,21 +2788,28 @@ void __cdecl smp_wake_hook(void* data) {
             return;
         }
         *handoff.command_data = data;
-        // Normal asynchronous work does not wait for the worker-pickup ack;
-        // renderer_idle already protects command-buffer reuse. Shutdown and
-        // explicitly synchronous operation retain the acknowledgement.
+        // render_completed is the stock worker-pickup acknowledgement. Actual
+        // backend completion is renderer_idle becoming signaled when the
+        // worker re-enters RendererSleep after executing this command list.
         const bool acknowledgement_ready =
             !wait_for_ack || ResetEvent(handoff.render_completed);
         const bool command_published = acknowledgement_ready &&
                                        SetEvent(handoff.command_ready);
-        const bool command_acknowledged =
+        const bool command_picked_up =
             !wait_for_ack ||
             (command_published &&
              WaitForSingleObject(handoff.render_completed, INFINITE) == WAIT_OBJECT_0);
-        if (!command_published || !command_acknowledged) {
+        const bool command_completed =
+            !wait_for_completion ||
+            (command_picked_up &&
+             WaitForSingleObject(handoff.renderer_idle, INFINITE) == WAIT_OBJECT_0);
+        if (!command_published || !command_picked_up || !command_completed) {
             (void)SetEvent(handoff.renderer_idle);
             g_reason.store("smp_persistent_wake_failed", std::memory_order_release);
             InterlockedExchange(&g_smp_persistent_context_state, -1);
+        }
+        if (wait_for_completion && command_completed) {
+            InterlockedIncrement64(&g_smp_synchronous_wait_count);
         }
         if (data == nullptr) {
             const LONG completed_state = persistent_smp_context_state();
@@ -3537,11 +3547,10 @@ bool install_smp_frontend_sleep_hook() noexcept {
                        std::memory_order_release);
         return false;
     }
-    if (InterlockedCompareExchange(&g_config_smp_synchronous, 0, 0) != 0) {
-        g_reason.store("smp_persistent_context_conflicts_synchronous",
-                       std::memory_order_release);
-        return false;
-    }
+    // Synchronous publication is supported by the persistent wake protocol:
+    // the worker keeps WGL ownership, acknowledges pickup through
+    // render_completed, then signals renderer_idle only after backend work.
+    // Waiting for both removes the queued frame without per-frame WGL handoff.
     if (!relocated_absolute_signature_matches(
             engine_address(k_engine_smp_frontend_sleep),
             k_smp_frontend_sleep_signature, 1U,
