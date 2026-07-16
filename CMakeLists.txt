@@ -102,4 +102,10 @@ if(BUILD_TESTING)
     target_link_options(player_scene_replay_tests PRIVATE /WX /Brepro)
     add_test(NAME player_scene_replay_tests COMMAND player_scene_replay_tests)
 
+    add_executable(renderer_diagnostics_tests tests/renderer_diagnostics_tests.cpp)
+    target_include_directories(renderer_diagnostics_tests PRIVATE src)
+    target_compile_options(renderer_diagnostics_tests PRIVATE /W4 /WX /permissive- /sdl /EHsc /Oi)
+    target_link_options(renderer_diagnostics_tests PRIVATE /WX /Brepro)
+    add_test(NAME renderer_diagnostics_tests COMMAND renderer_diagnostics_tests)
+
 endif()

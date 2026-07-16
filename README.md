@@ -75,8 +75,23 @@ The start of `ql_fps_launch.log` records the injected DLL path, its verified
 SHA-256, and the expected package SHA-256. For this version, both hashes must be:
 
 ```text
-E4F1C28BD0B4875754C1EDE1AECE61A311697403CDF31DDA1993ABC0826CC2CF
+6C3B3C935117896915ADD6933634FD2A1EE7D0E4E348D0B1C00A179ADC55DDAD
 ```
+
+### Rare renderer-corruption diagnostics
+
+This release records persistent renderer diagnostics; it does not claim that
+the rare text/scene corruption is fixed. Logging is enabled by default with
+`diagnostic_log=1`. The game directory contains:
+
+- `ql_fps_diagnostic.log`: current session history.
+- `ql_fps_diagnostic.previous.log`: the previous rotated history.
+
+The current log rotates at 8 MiB, keeping one previous file. Render and font
+hooks only place fixed records into memory; the telemetry worker writes them to
+disk. If corruption appears, leave the game open and avoid `vid_restart` until
+the logs are copied when practical. If the game is already closed or restarted,
+report it anyway—the files persist.
 
 If uncapped FPS works but `client accuracy` never appears after a completed LG
 hold, inspect that first log line and `ql_fps_telemetry.log`. Current telemetry

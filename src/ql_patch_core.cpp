@@ -15,6 +15,7 @@
 #include "player_style_fast_path.hpp"
 #include "raster_fingerprint.hpp"
 #include "render_interpolation.hpp"
+#include "renderer_diagnostics.hpp"
 #include "shadow_mark_cache.hpp"
 #include "snapshot_entity_cache.hpp"
 #include "smp_context_handoff.hpp"
@@ -400,6 +401,9 @@ constexpr std::size_t k_trace_endpoint_index = 3U;
 constexpr std::size_t k_max_deferred_font_uploads = 64U;
 constexpr std::size_t k_max_font_atlas_dimension = 4096U;
 constexpr std::size_t k_max_font_upload_bytes = 16U * 1024U * 1024U;
+constexpr std::size_t k_renderer_diagnostic_queue_capacity = 1024U;
+constexpr std::size_t k_renderer_diagnostic_drain_capacity = 256U;
+constexpr std::uint64_t k_renderer_diagnostic_log_max_bytes = 8U * 1024U * 1024U;
 constexpr GLsizei k_raster_fingerprint_width = 64;
 constexpr GLsizei k_raster_fingerprint_height = 64;
 constexpr std::size_t k_raster_fingerprint_bytes =
@@ -415,6 +419,12 @@ constexpr GLenum k_gl_pixel_pack_buffer = 0x88EBU;
 constexpr GLenum k_gl_texture0 = 0x84C0U;
 constexpr GLenum k_gl_texture1 = 0x84C1U;
 constexpr GLenum k_gl_texture_rectangle = 0x84F5U;
+constexpr GLenum k_gl_active_texture_state = 0x84E0U;
+constexpr GLenum k_gl_texture_binding_rectangle = 0x84F6U;
+constexpr GLenum k_gl_array_buffer_binding = 0x8894U;
+constexpr GLenum k_gl_element_array_buffer_binding = 0x8895U;
+constexpr GLenum k_gl_current_program = 0x8B8DU;
+constexpr GLenum k_gl_framebuffer_binding = 0x8CA6U;
 constexpr GLenum k_gl_stream_read = 0x88E1U;
 constexpr GLenum k_gl_read_only = 0x88B8U;
 constexpr GLenum k_gl_framebuffer = 0x8D40U;
@@ -681,6 +691,7 @@ volatile LONG g_worker_started{};
 volatile LONG g_installing{};
 volatile LONG g_status{k_stock};
 volatile LONG g_config_enabled{};
+volatile LONG g_config_diagnostic_log{1};
 volatile LONG g_config_fresh_view{1};
 volatile LONG g_config_highres_entity_interpolation{1};
 volatile LONG g_config_raster_fingerprint{};
@@ -845,6 +856,8 @@ volatile LONG64 g_player_style_mismatch_count{};
 volatile LONG64 g_player_style_mutation_failure_count{};
 volatile LONG64 g_player_style_bypass_count{};
 volatile LONG g_hud_cache_valid{};
+volatile LONG g_hud_cache_size{};
+volatile LONG g_hud_cache_integer_time{};
 volatile LONG g_renderer_epoch{1};
 volatile LONG g_raster_fingerprint_pending{};
 volatile LONG g_raster_fingerprint_active{};
@@ -920,6 +933,7 @@ volatile LONG g_render_fractional_us{};
 volatile LONG g_frame_interpolation_ppm{};
 volatile LONG g_entity_pose_transaction_entities{};
 volatile LONG64 g_qpc_frequency{};
+volatile LONG64 g_diagnostic_last_sample_qpc{};
 std::array<std::uint32_t, 3> g_last_entity_pose_bits{};
 bool g_last_entity_pose_valid{};
 ql1k::SubmittedPoseSignature<k_max_player_entities> g_last_submitted_pose_signature{};
@@ -1056,6 +1070,9 @@ SRWLOCK g_draw_lifecycle_gate = SRWLOCK_INIT;
 SRWLOCK g_hitreg_lock = SRWLOCK_INIT;
 SRWLOCK g_force_smp_patch_lock = SRWLOCK_INIT;
 SRWLOCK g_font_upload_lock = SRWLOCK_INIT;
+SRWLOCK g_renderer_diagnostic_lock = SRWLOCK_INIT;
+ql1k::RendererDiagnosticQueue<k_renderer_diagnostic_queue_capacity>
+    g_renderer_diagnostic_queue{};
 ShadowMarkCache g_shadow_mark_cache{};
 std::array<PlayerSceneCacheEntry, k_player_scene_cache_slots>
     g_player_scene_cache{};
@@ -1223,6 +1240,8 @@ struct RendererCommandSnapshot {
 
 void reset_hud_replay_cache() noexcept {
     InterlockedExchange(&g_hud_cache_valid, 0);
+    InterlockedExchange(&g_hud_cache_size, 0);
+    InterlockedExchange(&g_hud_cache_integer_time, 0);
     g_hud_replay_cache.size = 0;
     g_hud_replay_cache.integer_time = 0;
     g_hud_replay_cache.renderer_epoch = 0;
@@ -1300,6 +1319,164 @@ void advance_renderer_epoch() noexcept {
     return {*frame_index, root, used, true};
 }
 
+void enqueue_renderer_diagnostic(
+    const ql1k::RendererDiagnosticEvent event, const int* const texture = nullptr,
+    const int* const rectangle = nullptr, const int font_root = -1) noexcept {
+    if (InterlockedCompareExchange(&g_config_diagnostic_log, 0, 0) == 0) {
+        return;
+    }
+
+    ql1k::RendererDiagnosticRecord record{};
+    record.event = event;
+    record.qpc = qpc_start();
+    record.process_id = GetCurrentProcessId();
+    record.thread_id = GetCurrentThreadId();
+    const HGLRC current_context = wglGetCurrentContext();
+    const HDC current_dc = wglGetCurrentDC();
+    record.wgl_context = reinterpret_cast<std::uintptr_t>(current_context);
+    record.wgl_dc = reinterpret_cast<std::uintptr_t>(current_dc);
+    record.status = InterlockedCompareExchange(&g_status, 0, 0);
+    record.runtime_armed = InterlockedCompareExchange(&g_runtime_armed, 0, 0);
+    record.renderer_epoch = InterlockedCompareExchange(&g_renderer_epoch, 0, 0);
+    record.module_epoch = InterlockedCompareExchange(&g_module_serial, 0, 0);
+    record.smp_state = InterlockedCompareExchange(&g_smp_persistent_context_state, 0, 0);
+    record.smp_synchronous = InterlockedCompareExchange(&g_config_smp_synchronous, 0, 0);
+    record.smp_persistent =
+        InterlockedCompareExchange(&g_config_smp_persistent_context, 0, 0);
+    record.hud_replay_configured =
+        InterlockedCompareExchange(&g_config_hud_replay, 0, 0);
+    record.zero_bloom_configured =
+        InterlockedCompareExchange(&g_config_zero_bloom_fast_path, 0, 0);
+    record.color_correct_configured = InterlockedCompareExchange(
+        &g_config_color_correct_identity_fast_path, 0, 0);
+    record.shadow_cache_configured =
+        InterlockedCompareExchange(&g_config_shadow_mark_cache, 0, 0);
+    record.registration_complete =
+        InterlockedCompareExchange(&g_renderer_registration_complete, 0, 0);
+
+    const auto* const smp_active =
+        static_cast<const std::int32_t*>(engine_address(k_engine_smp_active));
+    const auto* const client_state =
+        static_cast<const std::int32_t*>(engine_address(k_engine_client_state));
+    const auto* const key_catchers =
+        static_cast<const std::int32_t*>(engine_address(k_engine_key_catchers));
+    const auto* const wgl_failures =
+        static_cast<const std::int32_t*>(engine_address(k_engine_smp_wgl_failures));
+    record.smp_active = smp_active == nullptr ? -1 : *smp_active;
+    record.client_state = client_state == nullptr ? -1 : *client_state;
+    record.key_catchers = key_catchers == nullptr ? -1 : *key_catchers;
+    record.wgl_failure_total = wgl_failures == nullptr ? -1 : *wgl_failures;
+
+    const auto* const current_tmu =
+        static_cast<const std::int32_t*>(engine_address(k_engine_gl_current_tmu));
+    const auto* const cached_textures =
+        static_cast<const std::int32_t*>(engine_address(k_engine_gl_current_textures));
+    if (current_tmu != nullptr) {
+        record.current_tmu = *current_tmu;
+    }
+    if (cached_textures != nullptr) {
+        record.cached_textures[0] = cached_textures[0];
+        record.cached_textures[1] = cached_textures[1];
+    }
+
+    if (current_context != nullptr) {
+        record.gl_valid = 1;
+        glGetIntegerv(k_gl_active_texture_state, &record.active_texture);
+        glGetIntegerv(GL_TEXTURE_BINDING_2D, &record.binding_2d);
+        glGetIntegerv(k_gl_texture_binding_rectangle, &record.binding_rectangle);
+        glGetIntegerv(k_gl_current_program, &record.current_program);
+        glGetIntegerv(k_gl_framebuffer_binding, &record.framebuffer);
+        glGetIntegerv(k_gl_array_buffer_binding, &record.array_buffer);
+        glGetIntegerv(k_gl_element_array_buffer_binding,
+                      &record.element_array_buffer);
+        glGetIntegerv(GL_VIEWPORT, record.viewport.data());
+        glGetIntegerv(GL_SCISSOR_BOX, record.scissor_box.data());
+        record.blend_enabled = glIsEnabled(GL_BLEND) != GL_FALSE ? 1 : 0;
+        record.depth_enabled = glIsEnabled(GL_DEPTH_TEST) != GL_FALSE ? 1 : 0;
+        record.scissor_enabled = glIsEnabled(GL_SCISSOR_TEST) != GL_FALSE ? 1 : 0;
+        record.cull_enabled = glIsEnabled(GL_CULL_FACE) != GL_FALSE ? 1 : 0;
+        if (record.current_tmu >= 0 && record.current_tmu < 2) {
+            const bool active_matches =
+                record.active_texture ==
+                static_cast<std::int32_t>(k_gl_texture0) + record.current_tmu;
+            record.binding_cache_match =
+                active_matches &&
+                        record.binding_2d ==
+                            record.cached_textures[static_cast<std::size_t>(
+                                record.current_tmu)]
+                    ? 1
+                    : 0;
+        }
+    }
+
+    const RendererCommandSnapshot commands = renderer_command_snapshot();
+    if (commands.valid) {
+        record.frame_index = commands.index;
+        record.command_root = reinterpret_cast<std::uintptr_t>(commands.root);
+        record.command_used = commands.used;
+    }
+    record.hud_cache_valid = InterlockedCompareExchange(&g_hud_cache_valid, 0, 0);
+    record.hud_cache_bytes = static_cast<std::uint64_t>(
+        (std::max)(InterlockedCompareExchange(&g_hud_cache_size, 0, 0), 0L));
+    record.hud_integer_time =
+        InterlockedCompareExchange(&g_hud_cache_integer_time, 0, 0);
+    record.hud_capture_total =
+        InterlockedCompareExchange64(&g_hud_capture_count, 0, 0);
+    record.hud_replay_total =
+        InterlockedCompareExchange64(&g_hud_replay_count, 0, 0);
+    record.hud_fallback_total =
+        InterlockedCompareExchange64(&g_hud_stock_fallback_count, 0, 0);
+    record.hud_reject_total =
+        InterlockedCompareExchange64(&g_hud_capture_reject_count, 0, 0);
+    if (texture != nullptr) {
+        record.font_texture = texture[0];
+        record.font_stride = texture[1];
+    }
+    if (rectangle != nullptr) {
+        for (std::size_t index = 0; index < record.font_rectangle.size(); ++index) {
+            record.font_rectangle[index] = rectangle[index];
+        }
+    }
+    record.font_root = font_root;
+    record.font_capture_total =
+        InterlockedCompareExchange64(&g_smp_font_upload_capture_count, 0, 0);
+    record.font_replay_total =
+        InterlockedCompareExchange64(&g_smp_font_upload_replay_count, 0, 0);
+    record.font_drop_total =
+        InterlockedCompareExchange64(&g_smp_font_upload_drop_count, 0, 0);
+    record.lifecycle_sequence =
+        InterlockedCompareExchange64(&g_smp_lifecycle_event_sequence, 0, 0);
+    record.font_capture_sequence =
+        InterlockedCompareExchange64(&g_smp_font_capture_event_sequence, 0, 0);
+    record.font_replay_sequence =
+        InterlockedCompareExchange64(&g_smp_font_replay_event_sequence, 0, 0);
+    record.context_sync_total =
+        InterlockedCompareExchange64(&g_smp_context_sync_count, 0, 0);
+    record.context_transfer_failure_total =
+        InterlockedCompareExchange64(&g_smp_context_transfer_failure_count, 0, 0);
+
+    AcquireSRWLockExclusive(&g_renderer_diagnostic_lock);
+    (void)g_renderer_diagnostic_queue.push(record);
+    ReleaseSRWLockExclusive(&g_renderer_diagnostic_lock);
+}
+
+void enqueue_periodic_renderer_diagnostic() noexcept {
+    if (InterlockedCompareExchange(&g_config_diagnostic_log, 0, 0) == 0) {
+        return;
+    }
+    const LONG64 now = qpc_start();
+    const LONG64 frequency = InterlockedCompareExchange64(&g_qpc_frequency, 0, 0);
+    const LONG64 interval = frequency > 1 ? frequency / 2 : 1;
+    const LONG64 previous =
+        InterlockedCompareExchange64(&g_diagnostic_last_sample_qpc, 0, 0);
+    if (!ql1k::renderer_diagnostic_sample_due(now, previous, interval) ||
+        InterlockedCompareExchange64(&g_diagnostic_last_sample_qpc, now, previous) !=
+            previous) {
+        return;
+    }
+    enqueue_renderer_diagnostic(ql1k::RendererDiagnosticEvent::endframe);
+}
+
 [[nodiscard]] bool hud_replay_gameplay_eligible() noexcept {
     const auto* const client_state =
         static_cast<const std::int32_t*>(engine_address(k_engine_client_state));
@@ -1337,6 +1514,153 @@ LONG64 average_interval_ns(const LONG64 ticks, const LONG64 samples,
     return nanoseconds >= static_cast<long double>(LLONG_MAX)
                ? LLONG_MAX
                : static_cast<LONG64>(nanoseconds + 0.5L);
+}
+
+bool diagnostic_log_path(const wchar_t* const name,
+                         wchar_t (&path)[MAX_PATH]) noexcept {
+    const DWORD length = GetModuleFileNameW(
+        reinterpret_cast<HMODULE>(&__ImageBase), path,
+        static_cast<DWORD>(std::size(path)));
+    if (length == 0 || length >= std::size(path)) {
+        return false;
+    }
+    wchar_t* const slash = wcsrchr(path, L'\\');
+    if (slash == nullptr) {
+        return false;
+    }
+    const std::size_t remaining =
+        std::size(path) - static_cast<std::size_t>(slash + 1 - path);
+    return wcscpy_s(slash + 1, remaining, name) == 0;
+}
+
+std::size_t format_renderer_diagnostic(
+    const ql1k::RendererDiagnosticRecord& record, char (&line)[4096]) noexcept {
+    const int bytes = _snprintf_s(
+        line, sizeof(line), _TRUNCATE,
+        "schema=%u event=%s qpc=%lld pid=%lu tid=%lu ctx=0x%llX dc=0x%llX "
+        "status=%ld armed=%ld renderer_epoch=%ld module_epoch=%ld smp_active=%ld "
+        "smp_state=%ld smp_sync=%ld smp_persistent=%ld hud_cfg=%ld bloom_cfg=%ld "
+        "color_cfg=%ld shadow_cfg=%ld client_state=%ld key_catchers=0x%lX "
+        "registration=%ld gl_valid=%ld active_texture=0x%lX binding_2d=%ld "
+        "binding_rect=%ld program=%ld framebuffer=%ld array_buffer=%ld "
+        "element_buffer=%ld viewport=%ld,%ld,%ld,%ld scissor=%ld,%ld,%ld,%ld "
+        "blend=%ld depth=%ld scissor_enabled=%ld cull=%ld current_tmu=%ld "
+        "cache0=%ld cache1=%ld binding_cache_match=%ld frame_index=%ld "
+        "command_root=0x%llX command_used=%ld hud_valid=%ld hud_bytes=%llu "
+        "hud_time=%ld hud_capture=%lld hud_replay=%lld hud_fallback=%lld "
+        "hud_reject=%lld font_texture=%ld font_stride=%ld font_rect=%ld,%ld,%ld,%ld "
+        "font_root=%ld font_capture=%lld font_replay=%lld font_drop=%lld "
+        "lifecycle_seq=%lld font_capture_seq=%lld font_replay_seq=%lld "
+        "context_sync=%lld context_fail=%lld wgl_fail=%ld\r\n",
+        record.schema_version,
+        ql1k::renderer_diagnostic_event_name(record.event),
+        static_cast<long long>(record.qpc),
+        static_cast<unsigned long>(record.process_id),
+        static_cast<unsigned long>(record.thread_id),
+        static_cast<unsigned long long>(record.wgl_context),
+        static_cast<unsigned long long>(record.wgl_dc), record.status,
+        record.runtime_armed, record.renderer_epoch, record.module_epoch,
+        record.smp_active, record.smp_state, record.smp_synchronous,
+        record.smp_persistent, record.hud_replay_configured,
+        record.zero_bloom_configured, record.color_correct_configured,
+        record.shadow_cache_configured, record.client_state,
+        static_cast<unsigned long>(record.key_catchers),
+        record.registration_complete, record.gl_valid,
+        static_cast<unsigned long>(record.active_texture), record.binding_2d,
+        record.binding_rectangle, record.current_program, record.framebuffer,
+        record.array_buffer, record.element_array_buffer, record.viewport[0],
+        record.viewport[1], record.viewport[2], record.viewport[3],
+        record.scissor_box[0], record.scissor_box[1], record.scissor_box[2],
+        record.scissor_box[3], record.blend_enabled, record.depth_enabled,
+        record.scissor_enabled, record.cull_enabled, record.current_tmu,
+        record.cached_textures[0], record.cached_textures[1],
+        record.binding_cache_match, record.frame_index,
+        static_cast<unsigned long long>(record.command_root), record.command_used,
+        record.hud_cache_valid,
+        static_cast<unsigned long long>(record.hud_cache_bytes),
+        record.hud_integer_time, static_cast<long long>(record.hud_capture_total),
+        static_cast<long long>(record.hud_replay_total),
+        static_cast<long long>(record.hud_fallback_total),
+        static_cast<long long>(record.hud_reject_total), record.font_texture,
+        record.font_stride, record.font_rectangle[0], record.font_rectangle[1],
+        record.font_rectangle[2], record.font_rectangle[3], record.font_root,
+        static_cast<long long>(record.font_capture_total),
+        static_cast<long long>(record.font_replay_total),
+        static_cast<long long>(record.font_drop_total),
+        static_cast<long long>(record.lifecycle_sequence),
+        static_cast<long long>(record.font_capture_sequence),
+        static_cast<long long>(record.font_replay_sequence),
+        static_cast<long long>(record.context_sync_total),
+        static_cast<long long>(record.context_transfer_failure_total),
+        record.wgl_failure_total);
+    return bytes >= 0
+               ? (std::min)(static_cast<std::size_t>(bytes), sizeof(line) - 1U)
+               : strnlen_s(line, sizeof(line));
+}
+
+void flush_renderer_diagnostics(const wchar_t* const log_path,
+                                const wchar_t* const previous_path,
+                                std::uint64_t& previous_dropped) noexcept {
+    if (InterlockedCompareExchange(&g_config_diagnostic_log, 0, 0) == 0 ||
+        log_path == nullptr || previous_path == nullptr) {
+        return;
+    }
+    std::array<ql1k::RendererDiagnosticRecord,
+               k_renderer_diagnostic_drain_capacity>
+        records{};
+    std::size_t count{};
+    std::uint64_t dropped{};
+    AcquireSRWLockExclusive(&g_renderer_diagnostic_lock);
+    count = g_renderer_diagnostic_queue.drain(records);
+    dropped = g_renderer_diagnostic_queue.dropped();
+    ReleaseSRWLockExclusive(&g_renderer_diagnostic_lock);
+    if (count == 0U && dropped == previous_dropped) {
+        return;
+    }
+
+    WIN32_FILE_ATTRIBUTE_DATA attributes{};
+    if (GetFileAttributesExW(log_path, GetFileExInfoStandard, &attributes)) {
+        const std::uint64_t size =
+            (static_cast<std::uint64_t>(attributes.nFileSizeHigh) << 32U) |
+            attributes.nFileSizeLow;
+        if (ql1k::renderer_diagnostic_log_needs_rotation(
+                size, k_renderer_diagnostic_log_max_bytes)) {
+            (void)DeleteFileW(previous_path);
+            (void)MoveFileExW(log_path, previous_path, MOVEFILE_REPLACE_EXISTING);
+        }
+    }
+
+    const HANDLE file = CreateFileW(
+        log_path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+        OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    if (dropped != previous_dropped) {
+        char loss[160]{};
+        const int length = _snprintf_s(
+            loss, sizeof(loss), _TRUNCATE,
+            "schema=1 event=queue_loss pid=%lu lost_total=%llu lost_delta=%llu\r\n",
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long long>(dropped),
+            static_cast<unsigned long long>(dropped - previous_dropped));
+        if (length > 0) {
+            DWORD written{};
+            (void)WriteFile(file, loss, static_cast<DWORD>(length), &written, nullptr);
+        }
+        previous_dropped = dropped;
+    }
+    for (std::size_t index = 0; index < count; ++index) {
+        char line[4096]{};
+        const std::size_t bytes = format_renderer_diagnostic(records[index], line);
+        if (bytes == 0U || bytes > MAXDWORD) {
+            continue;
+        }
+        DWORD written{};
+        (void)WriteFile(file, line, static_cast<DWORD>(bytes), &written, nullptr);
+    }
+    (void)FlushFileBuffers(file);
+    CloseHandle(file);
 }
 
 DWORD WINAPI telemetry_worker(void*) noexcept {
@@ -1479,8 +1803,20 @@ DWORD WINAPI telemetry_worker(void*) noexcept {
                      L"ql_fps_telemetry.log");
         }
     }
+    wchar_t diagnostic_path[MAX_PATH]{};
+    wchar_t diagnostic_previous_path[MAX_PATH]{};
+    const bool diagnostic_paths_valid =
+        diagnostic_log_path(L"ql_fps_diagnostic.log", diagnostic_path) &&
+        diagnostic_log_path(L"ql_fps_diagnostic.previous.log",
+                            diagnostic_previous_path);
+    std::uint64_t previous_diagnostic_dropped{};
+    enqueue_renderer_diagnostic(ql1k::RendererDiagnosticEvent::session_start);
     for (;;) {
         Sleep(500);
+        if (diagnostic_paths_valid) {
+            flush_renderer_diagnostics(diagnostic_path, diagnostic_previous_path,
+                                       previous_diagnostic_dropped);
+        }
         LARGE_INTEGER now{};
         if (!QueryPerformanceCounter(&now)) {
             continue;
@@ -3405,12 +3741,18 @@ bool capture_font_upload(const int* const texture, const int* const rectangle,
     InterlockedExchangeAdd64(&g_smp_font_upload_byte_count,
                              static_cast<LONG64>(sizes.packed_bytes));
     (void)record_smp_lifecycle_event(&g_smp_font_capture_event_sequence);
+    enqueue_renderer_diagnostic(ql1k::RendererDiagnosticEvent::font_capture,
+                                texture, rectangle, static_cast<int>(root));
     return true;
 }
 
 void run_stock_font_atlas_upload_preserving_state(
     const FontAtlasUploadFn stock, const int* const texture,
-    const int* const rectangle, const std::uint8_t* const pixels) noexcept {
+    const int* const rectangle, const std::uint8_t* const pixels,
+    const ql1k::RendererDiagnosticEvent before_event,
+    const ql1k::RendererDiagnosticEvent after_event,
+    const int font_root) noexcept {
+    enqueue_renderer_diagnostic(before_event, texture, rectangle, font_root);
     ql1k::run_font_upload_preserving_binding(
         [](int* const binding) noexcept {
             glGetIntegerv(GL_TEXTURE_BINDING_2D, binding);
@@ -3430,6 +3772,7 @@ void run_stock_font_atlas_upload_preserving_state(
                     std::span<std::int32_t>(current_textures, 2U));
             }
         });
+    enqueue_renderer_diagnostic(after_event, texture, rectangle, font_root);
 }
 
 void replay_font_uploads_for_commands(const int* const commands) noexcept {
@@ -3479,7 +3822,10 @@ void replay_font_uploads_for_commands(const int* const commands) noexcept {
                 const int rectangle[4]{record.layout.x, record.layout.y,
                                        record.layout.right, record.layout.bottom};
                 run_stock_font_atlas_upload_preserving_state(
-                    stock, texture, rectangle, g_font_upload_staging);
+                    stock, texture, rectangle, g_font_upload_staging,
+                    ql1k::RendererDiagnosticEvent::font_replay_before,
+                    ql1k::RendererDiagnosticEvent::font_replay_after,
+                    static_cast<int>(root));
                 InterlockedIncrement64(&g_smp_font_upload_replay_count);
                 (void)record_smp_lifecycle_event(
                     &g_smp_font_replay_event_sequence);
@@ -3520,7 +3866,9 @@ void __cdecl font_atlas_upload_hook(const int* const texture, const int* const r
     if (!defer) {
         if (stock != nullptr) {
             run_stock_font_atlas_upload_preserving_state(
-                stock, texture, rectangle, pixels);
+                stock, texture, rectangle, pixels,
+                ql1k::RendererDiagnosticEvent::font_direct_before,
+                ql1k::RendererDiagnosticEvent::font_direct_after, -1);
         }
         return;
     }
@@ -4589,6 +4937,19 @@ bool configured_fresh_view() {
     return length == 1 && value[0] == L'1';
 }
 
+bool configured_diagnostic_log() {
+    wchar_t value[8]{};
+    const std::wstring module = module_path(reinterpret_cast<HMODULE>(&__ImageBase));
+    const std::size_t separator = module.find_last_of(L"\\/");
+    const std::wstring config_path =
+        (separator == std::wstring::npos ? std::wstring{} : module.substr(0, separator)) +
+        L"\\ql_fps.cfg";
+    const DWORD length = GetPrivateProfileStringW(
+        L"ql_fps", L"diagnostic_log", L"1", value,
+        static_cast<DWORD>(std::size(value)), config_path.c_str());
+    return length == 1 && value[0] == L'1';
+}
+
 bool configured_highres_entity_interpolation() {
     wchar_t value[8]{};
     const std::wstring module = module_path(reinterpret_cast<HMODULE>(&__ImageBase));
@@ -5356,6 +5717,7 @@ void __cdecl endframe_hook() {
         return;
     }
     const auto original = g_endframe->original<EndFrameFn>();
+    enqueue_periodic_renderer_diagnostic();
     capture_raster_fingerprint();
     if (original != nullptr) {
         original();
@@ -5730,6 +6092,8 @@ void __cdecl cgame_draw_2d_hook() {
     g_hud_replay_cache.module_epoch =
         InterlockedCompareExchange(&g_module_serial, 0, 0);
     g_hud_replay_cache.captured_qpc = qpc_start();
+    InterlockedExchange(&g_hud_cache_size, static_cast<LONG>(segment_size));
+    InterlockedExchange(&g_hud_cache_integer_time, *integer_time);
     MemoryBarrier();
     InterlockedExchange(&g_hud_cache_valid, 1);
     InterlockedIncrement64(&g_hud_capture_count);
@@ -10423,6 +10787,7 @@ bool try_install() {
 
     bool installed = false;
     g_config_enabled = configured_enabled() && configured_experimental() ? 1 : 0;
+    g_config_diagnostic_log = configured_diagnostic_log() ? 1 : 0;
     g_config_fresh_view = configured_fresh_view() ? 1 : 0;
     g_config_highres_entity_interpolation =
         configured_highres_entity_interpolation() ? 1 : 0;
@@ -10528,6 +10893,7 @@ extern "C" BOOL WINAPI ql_patch_bootstrap() noexcept {
         return FALSE;
     }
     g_config_enabled = configured_enabled() && configured_experimental() ? 1 : 0;
+    g_config_diagnostic_log = configured_diagnostic_log() ? 1 : 0;
     g_config_force_smp = configured_force_smp() ? 1 : 0;
     g_config_smp_synchronous = configured_smp_synchronous() ? 1 : 0;
     g_config_smp_single_buffer = configured_smp_single_buffer() ? 1 : 0;
