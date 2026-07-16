@@ -1,8 +1,7 @@
 # QL1K
 
 QL1K is an experimental Quake Live client patch for the current 32-bit Steam
-build. It targets stable high-framerate play around the engine's 1 ms boundary
-(up to roughly 1,000 FPS) while keeping command history/network handling from
+build. It targets stable high-framerate (including above 1k) while keeping command history/network handling from
 failing at high latency.
 
 The safe release deliberately does **not** attempt sub-millisecond input or
