@@ -1,0 +1,7 @@
+# Installed text payloads are checksummed byte-for-byte in SHA256SUMS.txt.
+ql_fps.cfg -text
+ql_fps_launch.ps1 -text
+
+# Native payloads must never undergo text conversion.
+bin/ql_fps_patch.dll binary
+bin/ql_fps_injector.exe binary

@@ -1,5 +1,47 @@
-param([string]$GamePath)
+param(
+    [string]$GamePath,
+    [switch]$NoShortcut
+)
 $ErrorActionPreference = 'Stop'
+
+$payloads = [ordered]@{
+    'bin/ql_fps_patch.dll'    = 'ql_fps_patch.dll'
+    'bin/ql_fps_injector.exe' = 'ql_fps_injector.exe'
+    'ql_fps.cfg'              = 'ql_fps.cfg'
+    'ql_fps_launch.ps1'       = 'ql_fps_launch.ps1'
+}
+$manifestPath = Join-Path $PSScriptRoot 'SHA256SUMS.txt'
+
+function Read-Checksums([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Checksum manifest was not found: $Path"
+    }
+    $checksums = @{}
+    Get-Content -LiteralPath $Path | ForEach-Object {
+        if ($_ -match '^([0-9A-Fa-f]{64})\s+(.+)$') {
+            $checksums[$Matches[2].Trim().Replace('\', '/')] = $Matches[1].ToUpperInvariant()
+        }
+    }
+    return $checksums
+}
+
+function Assert-Checksum([string]$Path, [string]$Expected, [string]$Label) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "$Label was not found: $Path"
+    }
+    $actual = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToUpperInvariant()
+    if ($actual -ne $Expected) {
+        throw "$Label checksum mismatch. Expected $Expected but found $actual at: $Path"
+    }
+}
+
+$checksums = Read-Checksums $manifestPath
+foreach ($sourceName in $payloads.Keys) {
+    if (-not $checksums.ContainsKey($sourceName)) {
+        throw "Checksum manifest is missing required payload: $sourceName"
+    }
+    Assert-Checksum (Join-Path $PSScriptRoot $sourceName) $checksums[$sourceName] "Package file '$sourceName'"
+}
 
 if (-not $GamePath) {
     $candidates = @(
@@ -8,26 +50,76 @@ if (-not $GamePath) {
         'D:\SteamLibrary\steamapps\common\Quake Live',
         'E:\SteamLibrary\steamapps\common\Quake Live'
     )
-    $GamePath = $candidates | Where-Object { Test-Path (Join-Path $_ 'quakelive_steam.exe') } |
-        Select-Object -First 1
+    $matches = @($candidates | Where-Object {
+        Test-Path -LiteralPath (Join-Path $_ 'quakelive_steam.exe') -PathType Leaf
+    })
+    if ($matches.Count -gt 1) {
+        throw "Multiple Quake Live installations were found. Re-run with -GamePath and choose one: $($matches -join ', ')"
+    }
+    $GamePath = $matches | Select-Object -First 1
 }
-if (-not $GamePath -or -not (Test-Path (Join-Path $GamePath 'quakelive_steam.exe'))) {
+if (-not $GamePath -or -not (Test-Path -LiteralPath (Join-Path $GamePath 'quakelive_steam.exe') -PathType Leaf)) {
     throw 'Quake Live was not found. Run: .\install.ps1 -GamePath "X:\...\Quake Live"'
 }
-
-Copy-Item "$PSScriptRoot\bin\ql_fps_patch.dll" $GamePath -Force
-Copy-Item "$PSScriptRoot\bin\ql_fps_injector.exe" $GamePath -Force
-Copy-Item "$PSScriptRoot\ql_fps.cfg" $GamePath -Force
-Copy-Item "$PSScriptRoot\ql_fps_launch.ps1" $GamePath -Force
+$GamePath = (Resolve-Path -LiteralPath $GamePath).Path
+$game = Join-Path $GamePath 'quakelive_steam.exe'
+$running = Get-Process -Name quakelive_steam -ErrorAction SilentlyContinue | Where-Object {
+    try { [string]::Equals($_.Path, $game, [StringComparison]::OrdinalIgnoreCase) } catch { $false }
+}
+if ($running) {
+    throw 'Quake Live is running. Close it completely before installing QL1K.'
+}
 
 $shortcutPath = Join-Path ([Environment]::GetFolderPath('Desktop')) 'QL1K.lnk'
-$shell = New-Object -ComObject WScript.Shell
-$shortcut = $shell.CreateShortcut($shortcutPath)
-$shortcut.TargetPath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-$shortcut.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$GamePath\ql_fps_launch.ps1`""
-$shortcut.WorkingDirectory = $GamePath
-$shortcut.IconLocation = "$GamePath\quakelive_steam.exe,0"
-$shortcut.Save()
+if (-not $NoShortcut) {
+    Remove-Item -LiteralPath $shortcutPath -Force -ErrorAction SilentlyContinue
+}
+$stagingPath = Join-Path $GamePath ('.ql1k-install-' + [Guid]::NewGuid().ToString('N'))
+try {
+    New-Item -ItemType Directory -Path $stagingPath -ErrorAction Stop | Out-Null
+    foreach ($sourceName in $payloads.Keys) {
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot $sourceName) `
+            -Destination (Join-Path $stagingPath $payloads[$sourceName]) -Force
+        Assert-Checksum (Join-Path $stagingPath $payloads[$sourceName]) $checksums[$sourceName] `
+            "Staged file '$($payloads[$sourceName])'"
+    }
+    Copy-Item -LiteralPath $manifestPath `
+        -Destination (Join-Path $stagingPath 'SHA256SUMS.txt') -Force
+
+    foreach ($installedName in $payloads.Values) {
+        Remove-Item -LiteralPath (Join-Path $GamePath $installedName) `
+            -Force -ErrorAction SilentlyContinue
+    }
+    Remove-Item -LiteralPath (Join-Path $GamePath 'SHA256SUMS.txt') `
+        -Force -ErrorAction SilentlyContinue
+
+    foreach ($sourceName in $payloads.Keys) {
+        Copy-Item -LiteralPath (Join-Path $stagingPath $payloads[$sourceName]) `
+            -Destination (Join-Path $GamePath $payloads[$sourceName]) -Force
+    }
+    Copy-Item -LiteralPath (Join-Path $stagingPath 'SHA256SUMS.txt') `
+        -Destination (Join-Path $GamePath 'SHA256SUMS.txt') -Force
+
+    foreach ($sourceName in $payloads.Keys) {
+        Assert-Checksum (Join-Path $GamePath $payloads[$sourceName]) $checksums[$sourceName] `
+            "Installed file '$($payloads[$sourceName])'"
+    }
+
+    if (-not $NoShortcut) {
+        $shell = New-Object -ComObject WScript.Shell
+        $shortcut = $shell.CreateShortcut($shortcutPath)
+        $shortcut.TargetPath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+        $shortcut.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$GamePath\ql_fps_launch.ps1`""
+        $shortcut.WorkingDirectory = $GamePath
+        $shortcut.IconLocation = "$GamePath\quakelive_steam.exe,0"
+        $shortcut.Save()
+    }
+} finally {
+    Remove-Item -LiteralPath $stagingPath -Recurse -Force -ErrorAction SilentlyContinue
+}
 
 Write-Host "Installed QL1K to: $GamePath"
-Write-Host "Launch with: $shortcutPath"
+Write-Host "Verified ql_fps_patch.dll SHA-256: $($checksums['bin/ql_fps_patch.dll'])"
+if (-not $NoShortcut) {
+    Write-Host "Launch with: $shortcutPath"
+}

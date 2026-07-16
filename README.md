@@ -32,9 +32,15 @@ responsible for bans or other consequences.
 
 ## Install
 
-1. Download or clone this repository.
-2. Open PowerShell in the repository directory.
-3. Run:
+`main` is the only supported installation branch. Do not install an old branch,
+archive, or previously extracted copy.
+
+1. Close Quake Live completely.
+2. [Download the current `main` ZIP](https://github.com/Shepherd-Projects/QL1K/archive/refs/heads/main.zip)
+   and extract the complete archive to a new folder, or clone the repository's
+   `main` branch.
+3. Open PowerShell in that new repository directory.
+4. Run:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\install.ps1
@@ -50,15 +56,38 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1 `
   -GamePath "X:\SteamLibrary\steamapps\common\Quake Live"
 ```
 
-The installer copies only QL1K files and creates `QL1K.lnk` on the desktop.
-It does not edit `autoexec.cfg`, `qzconfig.cfg`, or other game configs.
+The installer verifies every packaged payload against `SHA256SUMS.txt`, copies
+the verified files, verifies the installed copies again, and creates `QL1K.lnk`
+on the desktop. If multiple Quake Live installations are detected, it stops and
+requires an explicit `-GamePath`. It does not edit `autoexec.cfg`,
+`qzconfig.cfg`, or other game configs.
 
-Always launch through the new **QL1K** desktop shortcut. It starts Quake Live,
-waits for the process, then injects `ql_fps_patch.dll`. Successful activation
-eventually appears in `ql_fps_launch.log` as:
+Always launch through the new **QL1K** desktop shortcut. It verifies all four
+installed payloads, creates Quake Live suspended, injects the verified
+`ql_fps_patch.dll`, then resumes the game. Successful activation eventually
+appears in `ql_fps_launch.log` as:
 
 ```text
 status=4 reason=runtime_candidate_active_unverified
+```
+
+The start of `ql_fps_launch.log` records the injected DLL path, its verified
+SHA-256, and the expected package SHA-256. For this version, both hashes must be:
+
+```text
+B3F9BD57E66EC376F2EAF8D47EA035C83F443F53C3D877DE2B25699B247E178C
+```
+
+If uncapped FPS works but `client accuracy` never appears after a completed LG
+hold, inspect that first log line and `ql_fps_telemetry.log`. Current telemetry
+contains `client_accuracy_kind` and `client_accuracy_opportunities`; a short log
+containing only FPS, simulation Hz, status, and reason proves an obsolete DLL is
+running. Close the game, reinstall from the current `main` ZIP into the exact
+game folder used by the QL1K shortcut, and verify the installed DLL:
+
+```powershell
+Get-FileHash "X:\SteamLibrary\steamapps\common\Quake Live\ql_fps_patch.dll" `
+  -Algorithm SHA256
 ```
 
 ## Game setting

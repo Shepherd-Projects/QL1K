@@ -7,13 +7,22 @@
 #include <vector>
 
 namespace {
-HMODULE remote_module(DWORD pid, const std::wstring& filename) {
+struct RemoteModule {
+    HMODULE handle{};
+    std::filesystem::path path{};
+};
+
+RemoteModule remote_module(DWORD pid, const std::wstring& filename) {
     const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
-    if (snapshot == INVALID_HANDLE_VALUE) return nullptr;
+    if (snapshot == INVALID_HANDLE_VALUE) return {};
     MODULEENTRY32W entry{sizeof(entry)};
-    HMODULE result{};
+    RemoteModule result{};
     if (Module32FirstW(snapshot, &entry)) do {
-        if (_wcsicmp(entry.szModule, filename.c_str()) == 0) { result = entry.hModule; break; }
+        if (_wcsicmp(entry.szModule, filename.c_str()) == 0) {
+            result.handle = entry.hModule;
+            result.path = entry.szExePath;
+            break;
+        }
     } while (Module32NextW(snapshot, &entry));
     CloseHandle(snapshot);
     return result;
@@ -42,7 +51,15 @@ void inject_existing(DWORD pid, const std::filesystem::path& requested_dll) {
     const HANDLE process = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION |
         PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ, FALSE, pid);
     if (!process) throw std::runtime_error("OpenProcess failed");
-    HMODULE remote = remote_module(pid, dll.filename().wstring());
+    const RemoteModule loaded = remote_module(pid, dll.filename().wstring());
+    HMODULE remote = loaded.handle;
+    if (remote) {
+        std::error_code error;
+        if (!std::filesystem::equivalent(dll, loaded.path, error) || error) {
+            CloseHandle(process);
+            throw std::runtime_error("loaded DLL path does not match requested DLL");
+        }
+    }
     if (!remote) {
         const std::wstring path = dll.wstring();
         const SIZE_T bytes = (path.size() + 1) * sizeof(wchar_t);
