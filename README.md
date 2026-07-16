@@ -75,7 +75,7 @@ The start of `ql_fps_launch.log` records the injected DLL path, its verified
 SHA-256, and the expected package SHA-256. For this version, both hashes must be:
 
 ```text
-B3F9BD57E66EC376F2EAF8D47EA035C83F443F53C3D877DE2B25699B247E178C
+859AC16FD4A4984E51ECEAF72C8ADAEBE96EB512B624B29311DAB3F7756625D0
 ```
 
 If uncapped FPS works but `client accuracy` never appears after a completed LG
