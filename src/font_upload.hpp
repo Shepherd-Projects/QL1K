@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <span>
 
 namespace ql1k {
 
@@ -21,14 +22,27 @@ struct FontUploadSizes {
     std::size_t staging_bytes{};
 };
 
-template <typename QueryBindingFn, typename UploadFn, typename RestoreBindingFn>
-inline void replay_font_upload_preserving_binding(
+[[nodiscard]] inline bool synchronize_texture_binding_cache(
+    const int binding, const int current_tmu,
+    const std::span<int> current_textures) noexcept {
+    if (current_tmu < 0 ||
+        static_cast<std::size_t>(current_tmu) >= current_textures.size()) {
+        return false;
+    }
+    current_textures[static_cast<std::size_t>(current_tmu)] = binding;
+    return true;
+}
+
+template <typename QueryBindingFn, typename UploadFn, typename RestoreBindingFn,
+          typename SynchronizeCacheFn>
+inline void run_font_upload_preserving_binding(
     QueryBindingFn query_binding, UploadFn upload,
-    RestoreBindingFn restore_binding) noexcept {
+    RestoreBindingFn restore_binding, SynchronizeCacheFn synchronize_cache) noexcept {
     int previous_binding{};
     query_binding(&previous_binding);
     upload();
     restore_binding(previous_binding);
+    synchronize_cache(previous_binding);
 }
 
 [[nodiscard]] constexpr bool should_defer_font_upload(

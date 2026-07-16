@@ -58,11 +58,13 @@ bool test_defers_only_after_registration_with_smp_active() {
            !ql1k::should_defer_font_upload(true, true, true, false, false, false);
 }
 
-bool test_replay_restores_texture_binding_after_upload() {
+bool test_upload_restores_and_synchronizes_texture_binding() {
     int binding = 37;
-    std::array<int, 3> sequence{};
+    std::array<int, 2> renderer_cache{11, 12};
+    int current_tmu = 1;
+    std::array<int, 4> sequence{};
     std::size_t step = 0;
-    ql1k::replay_font_upload_preserving_binding(
+    ql1k::run_font_upload_preserving_binding(
         [&](int* const snapshot) noexcept {
             sequence[step++] = 1;
             *snapshot = binding;
@@ -74,17 +76,36 @@ bool test_replay_restores_texture_binding_after_upload() {
         [&](const int snapshot) noexcept {
             sequence[step++] = 3;
             binding = snapshot;
+        },
+        [&](const int snapshot) noexcept {
+            sequence[step++] = 4;
+            (void)ql1k::synchronize_texture_binding_cache(
+                snapshot, current_tmu, renderer_cache);
         });
-    if (binding != 37 || sequence != std::array<int, 3>{1, 2, 3}) {
+    if (binding != 37 || renderer_cache != std::array<int, 2>{11, 37} ||
+        sequence != std::array<int, 4>{1, 2, 3, 4}) {
         return false;
     }
 
     binding = 0;
-    ql1k::replay_font_upload_preserving_binding(
+    current_tmu = 0;
+    renderer_cache = {91, 37};
+    ql1k::run_font_upload_preserving_binding(
         [&](int* const snapshot) noexcept { *snapshot = binding; },
         [&]() noexcept { binding = 91; },
-        [&](const int snapshot) noexcept { binding = snapshot; });
-    return binding == 0;
+        [&](const int snapshot) noexcept { binding = snapshot; },
+        [&](const int snapshot) noexcept {
+            (void)ql1k::synchronize_texture_binding_cache(
+                snapshot, current_tmu, renderer_cache);
+        });
+    if (binding != 0 || renderer_cache != std::array<int, 2>{0, 37}) {
+        return false;
+    }
+
+    const auto unchanged = renderer_cache;
+    return !ql1k::synchronize_texture_binding_cache(91, -1, renderer_cache) &&
+           !ql1k::synchronize_texture_binding_cache(91, 2, renderer_cache) &&
+           renderer_cache == unchanged;
 }
 
 } // namespace
@@ -93,10 +114,10 @@ int main() {
     const bool packed = test_pack_and_expand_preserve_dirty_rectangle();
     const bool rejected = test_rejects_invalid_or_excessive_layouts();
     const bool ownership = test_defers_only_after_registration_with_smp_active();
-    const bool binding = test_replay_restores_texture_binding_after_upload();
+    const bool binding = test_upload_restores_and_synchronizes_texture_binding();
     std::printf("font upload pack/expand: %s\n", packed ? "pass" : "fail");
     std::printf("font upload validation: %s\n", rejected ? "pass" : "fail");
     std::printf("font upload ownership gate: %s\n", ownership ? "pass" : "fail");
-    std::printf("font upload binding restore: %s\n", binding ? "pass" : "fail");
+    std::printf("font upload binding/cache sync: %s\n", binding ? "pass" : "fail");
     return packed && rejected && ownership && binding ? 0 : 1;
 }

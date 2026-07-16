@@ -139,6 +139,8 @@ constexpr std::uintptr_t k_engine_overbright_bits_cvar = 0x01740F00U;
 constexpr std::uintptr_t k_engine_enable_color_correct_cvar = 0x01740F04U;
 constexpr std::uintptr_t k_engine_gl_active_texture_slot = 0x01740E28U;
 constexpr std::uintptr_t k_engine_gl_bind_texture_slot = 0x016E3DFCU;
+constexpr std::uintptr_t k_engine_gl_current_textures = 0x01740F20U;
+constexpr std::uintptr_t k_engine_gl_current_tmu = 0x01740F28U;
 constexpr std::uintptr_t k_engine_gl_use_program_slot = 0x016E3D14U;
 constexpr std::uintptr_t k_engine_client_state = 0x01528BA0U;
 constexpr std::uintptr_t k_engine_key_catchers = 0x01528BA4U;
@@ -3406,6 +3408,30 @@ bool capture_font_upload(const int* const texture, const int* const rectangle,
     return true;
 }
 
+void run_stock_font_atlas_upload_preserving_state(
+    const FontAtlasUploadFn stock, const int* const texture,
+    const int* const rectangle, const std::uint8_t* const pixels) noexcept {
+    ql1k::run_font_upload_preserving_binding(
+        [](int* const binding) noexcept {
+            glGetIntegerv(GL_TEXTURE_BINDING_2D, binding);
+        },
+        [&]() noexcept { stock(texture, rectangle, pixels); },
+        [](const int binding) noexcept {
+            glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(binding));
+        },
+        [](const int binding) noexcept {
+            auto* const current_tmu = static_cast<const std::int32_t*>(
+                engine_address(k_engine_gl_current_tmu));
+            auto* const current_textures = static_cast<std::int32_t*>(
+                engine_address(k_engine_gl_current_textures));
+            if (current_tmu != nullptr && current_textures != nullptr) {
+                (void)ql1k::synchronize_texture_binding_cache(
+                    binding, *current_tmu,
+                    std::span<std::int32_t>(current_textures, 2U));
+            }
+        });
+}
+
 void replay_font_uploads_for_commands(const int* const commands) noexcept {
     if (commands == nullptr) {
         return;
@@ -3452,20 +3478,8 @@ void replay_font_uploads_for_commands(const int* const commands) noexcept {
                 const int texture[2]{record.texture, record.layout.stride};
                 const int rectangle[4]{record.layout.x, record.layout.y,
                                        record.layout.right, record.layout.bottom};
-                // The stock atlas callback binds its texture directly without
-                // updating the renderer's per-unit binding cache. Preserve the
-                // real binding so deferred replay cannot desynchronize that
-                // cache and make later draws sample the font atlas.
-                ql1k::replay_font_upload_preserving_binding(
-                    [](int* const binding) noexcept {
-                        glGetIntegerv(GL_TEXTURE_BINDING_2D, binding);
-                    },
-                    [&]() noexcept {
-                        stock(texture, rectangle, g_font_upload_staging);
-                    },
-                    [](const int binding) noexcept {
-                        glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(binding));
-                    });
+                run_stock_font_atlas_upload_preserving_state(
+                    stock, texture, rectangle, g_font_upload_staging);
                 InterlockedIncrement64(&g_smp_font_upload_replay_count);
                 (void)record_smp_lifecycle_event(
                     &g_smp_font_replay_event_sequence);
@@ -3505,7 +3519,8 @@ void __cdecl font_atlas_upload_hook(const int* const texture, const int* const r
         persistent_main_context_available);
     if (!defer) {
         if (stock != nullptr) {
-            stock(texture, rectangle, pixels);
+            run_stock_font_atlas_upload_preserving_state(
+                stock, texture, rectangle, pixels);
         }
         return;
     }
