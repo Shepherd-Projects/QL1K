@@ -3452,7 +3452,20 @@ void replay_font_uploads_for_commands(const int* const commands) noexcept {
                 const int texture[2]{record.texture, record.layout.stride};
                 const int rectangle[4]{record.layout.x, record.layout.y,
                                        record.layout.right, record.layout.bottom};
-                stock(texture, rectangle, g_font_upload_staging);
+                // The stock atlas callback binds its texture directly without
+                // updating the renderer's per-unit binding cache. Preserve the
+                // real binding so deferred replay cannot desynchronize that
+                // cache and make later draws sample the font atlas.
+                ql1k::replay_font_upload_preserving_binding(
+                    [](int* const binding) noexcept {
+                        glGetIntegerv(GL_TEXTURE_BINDING_2D, binding);
+                    },
+                    [&]() noexcept {
+                        stock(texture, rectangle, g_font_upload_staging);
+                    },
+                    [](const int binding) noexcept {
+                        glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(binding));
+                    });
                 InterlockedIncrement64(&g_smp_font_upload_replay_count);
                 (void)record_smp_lifecycle_event(
                     &g_smp_font_replay_event_sequence);

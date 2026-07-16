@@ -21,6 +21,16 @@ struct FontUploadSizes {
     std::size_t staging_bytes{};
 };
 
+template <typename QueryBindingFn, typename UploadFn, typename RestoreBindingFn>
+inline void replay_font_upload_preserving_binding(
+    QueryBindingFn query_binding, UploadFn upload,
+    RestoreBindingFn restore_binding) noexcept {
+    int previous_binding{};
+    query_binding(&previous_binding);
+    upload();
+    restore_binding(previous_binding);
+}
+
 [[nodiscard]] constexpr bool should_defer_font_upload(
     const bool late_activation_configured, const bool late_activation_active,
     const bool registration_complete, const bool smp_active,
