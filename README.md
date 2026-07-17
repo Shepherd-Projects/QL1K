@@ -1,20 +1,32 @@
 # QL1K
 
 QL1K is an experimental Quake Live client patch for the current 32-bit Steam
-build. It targets stable high-framerate (including above 1k) while keeping command history/network handling from
-failing at high latency.
+build. **This release is capped at 1,000 FPS.** It uses the game's stock 1 ms
+frame floor while keeping command history/network handling from failing at high
+latency.
 
 The safe release deliberately does **not** attempt sub-millisecond input or
 physics. Movement, mouse input, simulation, and command timing retain the
 game's integer-millisecond behavior.
 
-The production configuration uses zero-queued-frame persistent SMP. Mouse and
-keyboard state still enter through Quake Live's stock input and ~1 kHz command
-path, while each renderer command list is acknowledged before another frame is
-built. This removes the asynchronous one-frame render backlog without returning
-the OpenGL context to the main thread every frame. On the controlled reference
-demo, median presentation rate remained 2,585 FPS versus 3,957.5 FPS for the
-queued control.
+The production configuration deliberately leaves Quake Live's renderer,
+OpenGL context ownership, SMP handoff, fonts, HUD, post-processing, and visual
+resource lifecycle unchanged. QL1K only patches the stock 1 ms frame boundary,
+the client-frame/network command-history path, lifecycle safety seams, and the
+native client-accuracy display described below.
+
+## Release notes — renderer-stability fix
+
+- Fixed the observed rare text/scene corruption that made UI, console, and HUD
+  text unreadable until `vid_restart`.
+- Fixed the associated leave-server freeze/black-screen transition seen in the
+  failed renderer-overhaul builds.
+- Removed the experimental above-1,000-FPS renderer overhaul and restored stock
+  renderer, font, SMP/WGL context, HUD, and post-processing behavior.
+- Retained the network/FPS command-history decoupling and native per-hold LG
+  client-accuracy calculation.
+- User-validated through normal join, leave, menu/UI, and rejoin play with no
+  recurrence in the tested release candidate.
 
 ## Important disclaimer
 
@@ -75,30 +87,21 @@ The start of `ql_fps_launch.log` records the injected DLL path, its verified
 SHA-256, and the expected package SHA-256. For this version, both hashes must be:
 
 ```text
-6C3B3C935117896915ADD6933634FD2A1EE7D0E4E348D0B1C00A179ADC55DDAD
+794EC99C0450D898B570B81FA97213F47EF99A669104394C81A5B5E8506C152B
 ```
 
-### Rare renderer-corruption diagnostics
+### Minimal renderer rollback
 
-This release records persistent renderer diagnostics; it does not claim that
-the rare text/scene corruption is fixed. Logging is enabled by default with
-`diagnostic_log=1`. The game directory contains:
+This build fixes the observed rare text/scene corruption by removing the entire
+post-1,000-FPS renderer overhaul rather than adding another renderer workaround.
+It does not hook WGL/OpenGL, relocate font uploads, replay HUD/player renderer
+commands, or add bloom, color, shadow, or player-scene fast paths. The
+renderer-corruption diagnostic files from those experimental builds are no
+longer produced; normal `ql_fps_telemetry.log` remains available for FPS,
+network/history, lifecycle, and client-accuracy state.
 
-- `ql_fps_diagnostic.log`: current session history.
-- `ql_fps_diagnostic.previous.log`: the previous rotated history.
-
-The current log rotates at 8 MiB, keeping one previous file. Render and font
-hooks only place fixed records into memory; the telemetry worker writes them to
-disk. If corruption appears, leave the game open and avoid `vid_restart` until
-the logs are copied when practical. If the game is already closed or restarted,
-report it anyway—the files persist.
-
-If uncapped FPS works but `client accuracy` never appears after a completed LG
-hold, inspect that first log line and `ql_fps_telemetry.log`. Current telemetry
-contains `client_accuracy_kind` and `client_accuracy_opportunities`; a short log
-containing only FPS, simulation Hz, status, and reason proves an obsolete DLL is
-running. Close the game, reinstall from the current `main` ZIP into the exact
-game folder used by the QL1K shortcut, and verify the installed DLL:
+The fix was validated through normal join, leave, menu/UI, and rejoin play. To
+verify the exact installed release DLL:
 
 ```powershell
 Get-FileHash "X:\SteamLibrary\steamapps\common\Quake Live\ql_fps_patch.dll" `
