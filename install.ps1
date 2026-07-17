@@ -29,10 +29,43 @@ function Assert-Checksum([string]$Path, [string]$Expected, [string]$Label) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         throw "$Label was not found: $Path"
     }
-    $actual = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToUpperInvariant()
+    try {
+        $actual = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToUpperInvariant()
+    } catch {
+        $detail = $_.Exception.Message
+        if ($detail -match '(?i)virus|malware|potentially unwanted|0x800700e1') {
+            throw @"
+Security software blocked access to $Label at: $Path
+
+QL1K cannot install while this file is blocked, and checksum verification will not be bypassed.
+Open Windows Security > Virus & threat protection > Protection history, plus any third-party antivirus history, and review the detection. If you trust this repository, allow or restore the exact QL1K file. Then download the current main ZIP again, extract it to a new folder, and rerun install.ps1.
+
+If the Windows Security switches already appear disabled, another antivirus provider, Windows policy, or a still-active security service may be enforcing the block.
+
+Windows reported: $detail
+"@
+        }
+        throw @"
+$Label could not be read at: $Path
+
+Security software, file permissions, or an incomplete download may be blocking access. Check Windows Security > Virus & threat protection > Protection history and any third-party antivirus history, then download and extract a fresh current main ZIP before retrying.
+
+Windows reported: $detail
+"@
+    }
     if ($actual -ne $Expected) {
         throw "$Label checksum mismatch. Expected $Expected but found $actual at: $Path"
     }
+}
+
+function Find-QuakeLiveInstall([string[]]$Candidates) {
+    return @($Candidates |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        Select-Object -Unique |
+        Where-Object {
+            $gameExecutable = [IO.Path]::Combine($_, 'quakelive_steam.exe')
+            Test-Path -LiteralPath $gameExecutable -PathType Leaf
+        })
 }
 
 $checksums = Read-Checksums $manifestPath
@@ -50,15 +83,13 @@ if (-not $GamePath) {
         'D:\SteamLibrary\steamapps\common\Quake Live',
         'E:\SteamLibrary\steamapps\common\Quake Live'
     )
-    $matches = @($candidates | Where-Object {
-        Test-Path -LiteralPath (Join-Path $_ 'quakelive_steam.exe') -PathType Leaf
-    })
+    $matches = @(Find-QuakeLiveInstall $candidates)
     if ($matches.Count -gt 1) {
         throw "Multiple Quake Live installations were found. Re-run with -GamePath and choose one: $($matches -join ', ')"
     }
     $GamePath = $matches | Select-Object -First 1
 }
-if (-not $GamePath -or -not (Test-Path -LiteralPath (Join-Path $GamePath 'quakelive_steam.exe') -PathType Leaf)) {
+if (-not $GamePath -or -not (Test-Path -LiteralPath ([IO.Path]::Combine($GamePath, 'quakelive_steam.exe')) -PathType Leaf)) {
     throw 'Quake Live was not found. Run: .\install.ps1 -GamePath "X:\...\Quake Live"'
 }
 $GamePath = (Resolve-Path -LiteralPath $GamePath).Path

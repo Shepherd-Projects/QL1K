@@ -134,6 +134,25 @@ on the desktop. If multiple Quake Live installations are detected, it stops and
 requires an explicit `-GamePath`. It does not edit `autoexec.cfg`,
 `qzconfig.cfg`, or other game configs.
 
+### Installer troubleshooting
+
+- **`Join-Path ... A drive with the name 'D' does not exist`**: this came from
+  an older installer probing common Steam drive letters. The current installer
+  safely skips drives that are not mounted. Download the current `main` ZIP,
+  extract it to a new folder, and run that copy of `install.ps1`.
+- **`Get-FileHash ... contains a virus or potentially unwanted software`**:
+  Windows or another security provider denied access to that exact file before
+  QL1K could verify it. The current installer identifies this condition and
+  stops; it never bypasses the checksum. Follow the [antivirus steps above](#antivirus-alerts-and-false-positives),
+  including checking both Protection history and any third-party antivirus.
+  Visible Windows Security switches being off does not make the blocked file
+  readable: restore or allow the exact file in whichever security product or
+  policy recorded the detection, then download and extract a fresh ZIP before
+  retrying.
+- **`Quake Live was not found`**: pass the actual game directory explicitly
+  with `-GamePath` as shown above. The directory must contain
+  `quakelive_steam.exe`.
+
 Always launch through the new **QL1K** desktop shortcut. It verifies all four
 installed payloads, creates Quake Live suspended, injects the verified
 `ql_fps_patch.dll`, then resumes the game. Successful activation eventually

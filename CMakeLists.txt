@@ -39,4 +39,10 @@ if(BUILD_TESTING)
     target_compile_options(hitreg_state_tests PRIVATE /W4 /WX /permissive- /sdl /EHsc /Oi)
     target_link_options(hitreg_state_tests PRIVATE /WX /Brepro)
     add_test(NAME hitreg_state_tests COMMAND hitreg_state_tests)
+
+    find_program(WINDOWS_POWERSHELL_EXECUTABLE powershell.exe REQUIRED)
+    add_test(
+        NAME install_script_tests
+        COMMAND "${WINDOWS_POWERSHELL_EXECUTABLE}" -NoProfile -ExecutionPolicy Bypass
+                -File "${CMAKE_CURRENT_SOURCE_DIR}/tests/install_script_tests.ps1")
 endif()
