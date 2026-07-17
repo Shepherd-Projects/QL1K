@@ -28,6 +28,14 @@ native client-accuracy display described below.
 - User-validated through normal join, leave, menu/UI, and rejoin play with no
   recurrence in the tested release candidate.
 
+## Source-only maintenance cleanup
+
+The repository no longer carries the unused renderer-overhaul helper headers,
+their isolated tests, or their obsolete CMake targets. This cleanup does not
+change the packaged DLL, injector, configuration, launcher, or checksum
+manifest. Existing installations of the renderer-stability release remain
+current and do not need to be updated or reinstalled.
+
 ## Important disclaimer
 
 Use this only against bots or on servers whose owners/rules explicitly allow
@@ -41,6 +49,58 @@ responsible for bans or other consequences.
 - Quake Live on Steam, Windows, 32-bit game executable.
 - Exact supported game/cgame build. Unknown hashes fail closed.
 - PowerShell 5.1 or newer.
+
+## Antivirus alerts and false positives
+
+QL1K uses an unsigned DLL and an injector. Those are the same kinds of files
+and behaviours that security products watch closely, so some antivirus tools
+may flag or quarantine them. A detection is **not** automatically proof of
+malware, but it is also not automatically a false positive. Only continue if
+you downloaded QL1K from this repository, the published hashes match, and you
+are comfortable trusting the code.
+
+Do **not** turn off antivirus protection system-wide. Do not exclude your
+Downloads folder, an entire Steam library, a file type such as `.dll`, or a
+whole drive. Microsoft warns that exclusions stop Defender's real-time
+scanning of the excluded content and can make the device more vulnerable;
+scheduled scans and third-party security products may still scan it.
+
+For Microsoft Defender on Windows 10 or 11:
+
+1. First try the normal installation with Defender left on.
+2. If QL1K is blocked, open **Windows Security > Virus & threat protection >
+   Protection history**. Viewing the details and taking action may require an
+   administrator account or approval. Expand the detection and confirm that
+   its path is the QL1K download or Quake Live installation. If you have
+   reviewed the project and accept the risk:
+   - For **Threat found - action needed**, choose **Actions > Allow on
+     device**.
+   - For **Threat quarantined**, choose **Restore**. Defender may detect the
+     restored file again; then choose **Allow on device**.
+   - For **Threat blocked**, a removed item, or a SmartScreen block, allowing
+     it does not restore the missing file; choose **Allow** so the next copy
+     is not blocked automatically.
+   After **any** alert that interrupted the download or installation, download
+   the current `main` ZIP again, extract the complete archive to a new folder,
+   and rerun `install.ps1`. Do not reuse a partial extraction. Let the
+   installer verify the fresh payload against `SHA256SUMS.txt`.
+3. If Defender repeatedly removes the same verified files, open **Virus &
+   threat protection > Manage settings > Exclusions > Add or remove
+   exclusions**. Prefer **File** exclusions for the exact installed
+   `ql_fps_patch.dll` and `ql_fps_injector.exe`. Use a **Folder** exclusion for
+   the exact Quake Live installation only as a last resort. Never broaden the
+   exclusion beyond what QL1K needs.
+
+Microsoft documents both [how to review, restore, or allow a detection](https://support.microsoft.com/en-us/windows/security/windows-security/protection-history-in-the-windows-security-app)
+and [how exclusions work and why they reduce protection](https://support.microsoft.com/en-us/windows/virus-and-threat-protection-in-the-windows-security-app-1362f4cd-d71a-b52a-0b66-c2820032b65e).
+For another antivirus product, use its quarantine/history screen and allow-list
+only the exact QL1K files after the same checks; menu names vary by vendor.
+
+The complete source is public in this repository, the installer verifies the
+four packaged files against `SHA256SUMS.txt`, and the [build instructions](#build-from-source)
+let you compile the binaries yourself. Tools such as Codex or Claude can help
+explain or review the source, but an AI review is not proof that software is
+safe and should not replace your own security decision.
 
 ## Install
 
@@ -183,8 +243,7 @@ powershell -ExecutionPolicy Bypass -File .\uninstall.ps1 `
 Visual Studio 2022 Build Tools and CMake 3.28+:
 
 ```powershell
-cmake -S . -B build -G "Visual Studio 17 2022" -A Win32 `
-  -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+cmake -S . -B build -G "Visual Studio 17 2022" -A Win32
 cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
