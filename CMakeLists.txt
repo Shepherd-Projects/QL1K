@@ -34,6 +34,12 @@ set_target_properties(ql_fps_injector PROPERTIES
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(frame_pacer_tests tests/frame_pacer_tests.cpp)
+    target_include_directories(frame_pacer_tests PRIVATE src)
+    target_compile_options(frame_pacer_tests PRIVATE /W4 /WX /permissive- /sdl /EHsc /Oi)
+    target_link_options(frame_pacer_tests PRIVATE /WX /Brepro)
+    add_test(NAME frame_pacer_tests COMMAND frame_pacer_tests)
+
     add_executable(hitreg_state_tests tests/hitreg_state_tests.cpp)
     target_include_directories(hitreg_state_tests PRIVATE src)
     target_compile_options(hitreg_state_tests PRIVATE /W4 /WX /permissive- /sdl /EHsc /Oi)

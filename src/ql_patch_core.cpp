@@ -4,6 +4,7 @@
 
 #include <safetyhook.hpp>
 
+#include "frame_pacer.hpp"
 #include "hitreg_state.hpp"
 
 #include <array>
@@ -30,6 +31,7 @@ constexpr char k_cgame_hash[] =
 
 constexpr std::uintptr_t k_engine_preferred_base = 0x00400000U;
 constexpr std::uintptr_t k_cgame_preferred_base = 0x10000000U;
+constexpr std::uintptr_t k_engine_cvar_get_range = 0x004CDD30U;
 constexpr std::uintptr_t k_engine_s1 = 0x004CC83EU;
 constexpr std::uintptr_t k_engine_s2 = 0x004CB710U;
 constexpr std::uintptr_t k_engine_s3 = 0x004BC3E0U;
@@ -50,6 +52,7 @@ constexpr std::uintptr_t k_engine_s2_absolute = 0x0145B950U;
 constexpr std::uintptr_t k_engine_time_absolute = 0x01205E30U;
 constexpr std::uintptr_t k_engine_s11_absolute = 0x01528BA4U;
 constexpr std::uintptr_t k_engine_present_absolute = 0x0146CC34U;
+constexpr std::uintptr_t k_engine_com_maxfps = 0x0145CA48U;
 constexpr std::uintptr_t k_cgame_warning_compare = 0x1000AF2EU;
 constexpr std::uintptr_t k_cgame_predict_compare = 0x10044884U;
 constexpr std::uintptr_t k_cgame_warning_entry = 0x1000AEF0U;
@@ -69,6 +72,9 @@ constexpr std::uintptr_t k_cgame_warning_absolute = 0x10075000U;
 constexpr std::uintptr_t k_cgame_fps_absolute = 0x10ABAF8CU;
 
 constexpr std::array<std::uint8_t, 5> k_s1_signature{0xE8, 0x4D, 0xF4, 0xFF, 0xFF};
+constexpr std::array<std::uint8_t, 16> k_cvar_get_range_signature{
+    0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x0C, 0x8B, 0x45,
+    0x10, 0x53, 0x56, 0x57, 0x50, 0xFF, 0x15, 0x54};
 constexpr std::array<std::uint8_t, 8> k_s2_signature{
     0x55, 0x8B, 0xEC, 0xA1, 0x50, 0xB9, 0x45, 0x01};
 constexpr std::array<std::uint8_t, 9> k_s3_signature{
@@ -120,6 +126,13 @@ enum : LONG {
     k_runtime_active = 4,
 };
 
+enum : LONG {
+    k_maxfps_range_unseen = 0,
+    k_maxfps_range_updating = 1,
+    k_maxfps_range_ready = 2,
+    k_maxfps_range_failed = 3,
+};
+
 struct AuxiliaryRecord {
     std::int32_t command_number{};
     std::int32_t server_time{};
@@ -133,7 +146,40 @@ struct HistorySelection {
     LONG generation{};
 };
 
+struct PacerSelection {
+    int cap{};
+    int floor_ms{};
+    bool qpc_healthy{};
+    bool valid{};
+};
+
+struct PacerTelemetrySnapshot {
+    LONG cap{};
+    LONG floor_ms{};
+    LONG generation{};
+    LONG64 commits{};
+    LONG64 floor_ms_total{};
+    LONG64 floor_1{};
+    LONG64 floor_2{};
+    LONG64 floor_3_plus{};
+    LONG64 qpc_failures{};
+};
+
+struct PacerTelemetryCounters {
+    volatile LONG sequence{};
+    volatile LONG cap{};
+    volatile LONG floor_ms{};
+    volatile LONG generation{};
+    volatile LONG64 commits{};
+    volatile LONG64 floor_ms_total{};
+    volatile LONG64 floor_1{};
+    volatile LONG64 floor_2{};
+    volatile LONG64 floor_3_plus{};
+    volatile LONG64 qpc_failures{};
+};
+
 using DeltaFn = int(__cdecl*)(int);
+using CvarGetRangeFn = void*(__cdecl*)(const char*, const char*, const char*, const char*, int);
 using ClientFrameFn = void(__cdecl*)(int);
 using PublisherFn = void(__cdecl*)();
 using GetterFn = int(__cdecl*)(int, void*);
@@ -158,6 +204,8 @@ struct ReplayAuthorization {
 volatile LONG g_bootstrap_attempted{};
 volatile LONG g_worker_started{};
 volatile LONG g_installing{};
+volatile LONG g_engine_cap_hook_ready{};
+volatile LONG g_maxfps_range_state{};
 volatile LONG g_status{k_stock};
 volatile LONG g_config_enabled{};
 volatile LONG g_runtime_armed{};
@@ -177,7 +225,10 @@ volatile LONG g_measured_present_fps{};
 volatile LONG g_measured_simulation_hz{};
 volatile LONG64 g_present_count{};
 volatile LONG64 g_simulation_count{};
+volatile LONG64 g_qpc_frequency{};
+PacerTelemetryCounters g_pacer_telemetry{};
 std::atomic<const char*> g_reason{"not_started"};
+std::atomic<void*> g_maxfps_cvar{};
 std::array<char, 65> g_engine_hash{};
 std::array<char, 65> g_cgame_hash{};
 
@@ -195,6 +246,7 @@ CgameEntryFn g_stock_warning_entry{};
 CgameEntryFn g_stock_predict_entry{};
 
 safetyhook::MidHook* g_s1{};
+safetyhook::InlineHook* g_maxfps_range_hook{};
 safetyhook::InlineHook* g_s2{};
 safetyhook::InlineHook* g_s3{};
 safetyhook::InlineHook* g_s4{};
@@ -238,6 +290,8 @@ std::int32_t g_decision_snapshot{};
 bool g_decision_valid{};
 
 __declspec(thread) unsigned char g_zero_frame_token{};
+__declspec(thread) ql1k::FramePacer g_frame_pacer{};
+__declspec(thread) PacerSelection g_pacer_selection{};
 __declspec(thread) ReplayAuthorization g_replay_auth{};
 __declspec(thread) LONG g_s9_token_depth{};
 __declspec(thread) LONG g_module_ticket_depth{};
@@ -255,6 +309,82 @@ void reset_hitreg() {
     InterlockedExchange64(&g_hitreg_trace_none, 0);
     InterlockedExchange64(&g_hitreg_trace_other, 0);
     InterlockedExchange(&g_hitreg_trace_last_entity, -1);
+}
+
+void record_pacer_commit(const int cap, const int floor_ms,
+                         const bool qpc_healthy) noexcept {
+    if (floor_ms < 1) {
+        return;
+    }
+
+    // S2 is the sole writer. The sequence keeps the telemetry worker from
+    // observing counters midway through a cap-generation reset.
+    InterlockedIncrement(&g_pacer_telemetry.sequence);
+    if (InterlockedCompareExchange(&g_pacer_telemetry.cap, 0, 0) != cap) {
+        InterlockedExchange(&g_pacer_telemetry.cap, cap);
+        InterlockedExchange(&g_pacer_telemetry.floor_ms, 0);
+        InterlockedIncrement(&g_pacer_telemetry.generation);
+        InterlockedExchange64(&g_pacer_telemetry.commits, 0);
+        InterlockedExchange64(&g_pacer_telemetry.floor_ms_total, 0);
+        InterlockedExchange64(&g_pacer_telemetry.floor_1, 0);
+        InterlockedExchange64(&g_pacer_telemetry.floor_2, 0);
+        InterlockedExchange64(&g_pacer_telemetry.floor_3_plus, 0);
+        InterlockedExchange64(&g_pacer_telemetry.qpc_failures, 0);
+    }
+
+    InterlockedExchange(&g_pacer_telemetry.floor_ms, floor_ms);
+    InterlockedIncrement64(&g_pacer_telemetry.commits);
+    (void)InterlockedExchangeAdd64(&g_pacer_telemetry.floor_ms_total, floor_ms);
+    if (floor_ms == 1) {
+        InterlockedIncrement64(&g_pacer_telemetry.floor_1);
+    } else if (floor_ms == 2) {
+        InterlockedIncrement64(&g_pacer_telemetry.floor_2);
+    } else {
+        InterlockedIncrement64(&g_pacer_telemetry.floor_3_plus);
+    }
+    if (!qpc_healthy) {
+        InterlockedIncrement64(&g_pacer_telemetry.qpc_failures);
+    }
+    InterlockedIncrement(&g_pacer_telemetry.sequence);
+}
+
+bool snapshot_pacer_telemetry(PacerTelemetrySnapshot& snapshot) noexcept {
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        const LONG sequence =
+            InterlockedCompareExchange(&g_pacer_telemetry.sequence, 0, 0);
+        if ((sequence & 1) != 0) {
+            YieldProcessor();
+            continue;
+        }
+
+        PacerTelemetrySnapshot candidate{};
+        candidate.cap = InterlockedCompareExchange(&g_pacer_telemetry.cap, 0, 0);
+        candidate.floor_ms =
+            InterlockedCompareExchange(&g_pacer_telemetry.floor_ms, 0, 0);
+        candidate.generation =
+            InterlockedCompareExchange(&g_pacer_telemetry.generation, 0, 0);
+        candidate.commits =
+            InterlockedCompareExchange64(&g_pacer_telemetry.commits, 0, 0);
+        candidate.floor_ms_total =
+            InterlockedCompareExchange64(&g_pacer_telemetry.floor_ms_total, 0, 0);
+        candidate.floor_1 =
+            InterlockedCompareExchange64(&g_pacer_telemetry.floor_1, 0, 0);
+        candidate.floor_2 =
+            InterlockedCompareExchange64(&g_pacer_telemetry.floor_2, 0, 0);
+        candidate.floor_3_plus =
+            InterlockedCompareExchange64(&g_pacer_telemetry.floor_3_plus, 0, 0);
+        candidate.qpc_failures =
+            InterlockedCompareExchange64(&g_pacer_telemetry.qpc_failures, 0, 0);
+
+        const LONG verified_sequence =
+            InterlockedCompareExchange(&g_pacer_telemetry.sequence, 0, 0);
+        if (sequence == verified_sequence && (verified_sequence & 1) == 0) {
+            snapshot = candidate;
+            return true;
+        }
+        YieldProcessor();
+    }
+    return false;
 }
 
 void record_hitreg_usercmd(const AuxiliaryRecord& record) {
@@ -331,6 +461,7 @@ DWORD WINAPI telemetry_worker(void*) noexcept {
     }
     LONG64 previous_presents = InterlockedCompareExchange64(&g_present_count, 0, 0);
     LONG64 previous_simulation = InterlockedCompareExchange64(&g_simulation_count, 0, 0);
+    PacerTelemetrySnapshot pacer{};
     wchar_t log_path[MAX_PATH]{};
     const DWORD length = GetModuleFileNameW(reinterpret_cast<HMODULE>(&__ImageBase), log_path,
                                             static_cast<DWORD>(std::size(log_path)));
@@ -369,15 +500,22 @@ DWORD WINAPI telemetry_worker(void*) noexcept {
         hitreg = g_hitreg_state.published();
         hitreg_diagnostics = g_hitreg_state.diagnostics();
         ReleaseSRWLockShared(&g_hitreg_lock);
+        PacerTelemetrySnapshot current_pacer{};
+        if (snapshot_pacer_telemetry(current_pacer)) {
+            pacer = current_pacer;
+        }
         const char* const runtime_reason = g_reason.load(std::memory_order_acquire);
 
         // This record intentionally carries both immutable hold data and
         // session diagnostics. Never let a future field addition turn
         // telemetry truncation into the CRT invalid-parameter process abort.
-        char line[1536]{};
+        char line[2048]{};
         const int formatted_bytes = _snprintf_s(
             line, sizeof(line), _TRUNCATE,
             "measured_present_fps=%ld simulation_hz=%ld status=%ld reason=%s "
+            "pacer_cap=%ld pacer_floor_ms=%ld pacer_generation=%ld "
+            "pacer_commits=%lld pacer_floor_ms_total=%lld pacer_floor_1=%lld "
+            "pacer_floor_2=%lld pacer_floor_3_plus=%lld pacer_qpc_failures=%lld "
             "client_accuracy_kind=%s client_accuracy_percent_hundredths=%lu "
             "client_accuracy_hits=%lu client_accuracy_opportunities=%lu "
             "hitreg_generation=%llu hitreg_kind=%s hitreg_percent_hundredths=%lu "
@@ -396,6 +534,13 @@ DWORD WINAPI telemetry_worker(void*) noexcept {
             "hitreg_session_trace_other=%lld hitreg_session_trace_last=%ld\r\n",
             fps, sim_hz, InterlockedCompareExchange(&g_status, 0, 0),
             runtime_reason == nullptr ? "unknown" : runtime_reason,
+            pacer.cap, pacer.floor_ms, pacer.generation,
+            static_cast<long long>(pacer.commits),
+            static_cast<long long>(pacer.floor_ms_total),
+            static_cast<long long>(pacer.floor_1),
+            static_cast<long long>(pacer.floor_2),
+            static_cast<long long>(pacer.floor_3_plus),
+            static_cast<long long>(pacer.qpc_failures),
             client_accuracy_kind_name(hitreg.client_accuracy_kind),
             static_cast<unsigned long>(hitreg.client_accuracy_percent_hundredths),
             static_cast<unsigned long>(hitreg.client_accuracy_hits),
@@ -1282,21 +1427,177 @@ void __cdecl predictor_entry_hook() {
     maybe_recover_history();
 }
 
+bool maxfps_range_matches(void* const cvar) noexcept {
+    if (cvar == nullptr) {
+        return false;
+    }
+    constexpr std::size_t k_maximum_string_offset = 0x18U;
+    constexpr std::size_t k_maximum_float_offset = 0x38U;
+    const auto* const bytes = static_cast<const std::uint8_t*>(cvar);
+    const char* maximum_string{};
+    float maximum_value{};
+    std::memcpy(&maximum_string, bytes + k_maximum_string_offset, sizeof(maximum_string));
+    std::memcpy(&maximum_value, bytes + k_maximum_float_offset, sizeof(maximum_value));
+    return maximum_string != nullptr && strnlen_s(maximum_string, 5U) == 4U &&
+           std::memcmp(maximum_string, "1000", 4U) == 0 && maximum_value == 1000.0F;
+}
+
+bool capture_maxfps_cvar(void* const cvar) noexcept {
+    if (!maxfps_range_matches(cvar)) {
+        InterlockedExchange(&g_maxfps_range_state, k_maxfps_range_failed);
+        g_reason.store("com_maxfps_range_update_failed", std::memory_order_release);
+        return false;
+    }
+    g_maxfps_cvar.store(cvar, std::memory_order_release);
+    InterlockedExchange(&g_maxfps_range_state, k_maxfps_range_ready);
+    return true;
+}
+
+void* __cdecl com_maxfps_range_hook(const char* const name, const char* const default_value,
+                                    const char* const minimum_value,
+                                    const char* const maximum_value, const int flags) {
+    const auto original = g_maxfps_range_hook == nullptr
+                              ? nullptr
+                              : g_maxfps_range_hook->original<CvarGetRangeFn>();
+    if (original == nullptr) {
+        InterlockedExchange(&g_maxfps_range_state, k_maxfps_range_failed);
+        g_reason.store("com_maxfps_range_trampoline_missing", std::memory_order_release);
+        return nullptr;
+    }
+
+    const bool is_maxfps = name != nullptr && std::strcmp(name, "com_maxfps") == 0;
+    void* const result = original(name, default_value, minimum_value,
+                                  is_maxfps ? "1000" : maximum_value, flags);
+    if (is_maxfps) {
+        (void)capture_maxfps_cvar(result);
+    }
+    return result;
+}
+
+void* live_maxfps_cvar() noexcept {
+    auto* const slot = static_cast<void* const*>(engine_address(k_engine_com_maxfps));
+    void* const registered = slot == nullptr ? nullptr : *slot;
+    if (registered != nullptr) {
+        g_maxfps_cvar.store(registered, std::memory_order_release);
+        return registered;
+    }
+    return g_maxfps_cvar.load(std::memory_order_acquire);
+}
+
+bool ensure_maxfps_range() noexcept {
+    const LONG state = InterlockedCompareExchange(&g_maxfps_range_state, 0, 0);
+    if (state == k_maxfps_range_ready) {
+        if (live_maxfps_cvar() != nullptr) {
+            return true;
+        }
+        InterlockedExchange(&g_maxfps_range_state, k_maxfps_range_failed);
+        g_reason.store("com_maxfps_pointer_unavailable", std::memory_order_release);
+        return false;
+    }
+    if (state == k_maxfps_range_failed) {
+        return false;
+    }
+
+    const LONG previous = InterlockedCompareExchange(
+        &g_maxfps_range_state, k_maxfps_range_updating, k_maxfps_range_unseen);
+    if (previous != k_maxfps_range_unseen) {
+        return previous == k_maxfps_range_ready;
+    }
+
+    const auto original = g_maxfps_range_hook == nullptr
+                              ? nullptr
+                              : g_maxfps_range_hook->original<CvarGetRangeFn>();
+    if (original == nullptr) {
+        InterlockedExchange(&g_maxfps_range_state, k_maxfps_range_failed);
+        g_reason.store("com_maxfps_range_trampoline_missing", std::memory_order_release);
+        return false;
+    }
+    void* const cvar = original("com_maxfps", "125", "30", "1000", 0x81001);
+    return capture_maxfps_cvar(cvar);
+}
+
+bool read_requested_fps(int& requested_fps) noexcept {
+    if (InterlockedCompareExchange(&g_maxfps_range_state, 0, 0) != k_maxfps_range_ready) {
+        return false;
+    }
+    void* const cvar = live_maxfps_cvar();
+    if (cvar == nullptr) {
+        return false;
+    }
+
+    constexpr std::size_t k_current_string_offset = 0x04U;
+    constexpr std::size_t k_integer_value_offset = 0x30U;
+    constexpr std::size_t k_maximum_value_length = 32U;
+    const auto* const bytes = static_cast<const std::uint8_t*>(cvar);
+    const char* current_string{};
+    int integer_value{};
+    std::memcpy(&current_string, bytes + k_current_string_offset, sizeof(current_string));
+    std::memcpy(&integer_value, bytes + k_integer_value_offset, sizeof(integer_value));
+    if (current_string == nullptr) {
+        return false;
+    }
+    const std::size_t length = strnlen_s(current_string, k_maximum_value_length);
+    if (length == k_maximum_value_length) {
+        return false;
+    }
+    requested_fps = ql1k::normalize_requested_fps(
+        integer_value, std::string_view(current_string, length));
+    return true;
+}
+
 void frame_floor_hook(safetyhook::Context& context) {
+    g_pacer_selection.valid = false;
     if (InterlockedCompareExchange(&g_runtime_armed, 0, 0) == 0 || context.ebp == 0) {
         return;
     }
-    // Preserve the engine's 1 ms input/usercmd boundary. Sub-millisecond
-    // presentation without a transient cgame camera repeats committed view and
-    // can starve/lose perceived mouse motion under sustained busy rendering.
-    *reinterpret_cast<std::int32_t*>(context.ebp - 4U) = 1;
+    if (!ensure_maxfps_range()) {
+        if (InterlockedCompareExchange(&g_maxfps_range_state, 0, 0) ==
+            k_maxfps_range_failed) {
+            mark_permanent_fault("com_maxfps_range_unavailable");
+        }
+        return;
+    }
+
+    int requested_fps{};
+    if (!read_requested_fps(requested_fps)) {
+        mark_permanent_fault("com_maxfps_value_unavailable");
+        return;
+    }
+    LARGE_INTEGER now{};
+    const bool counter_available = QueryPerformanceCounter(&now) != FALSE;
+    const std::int64_t timestamp = counter_available ? now.QuadPart : -1;
+    const std::int64_t frequency = InterlockedCompareExchange64(&g_qpc_frequency, 0, 0);
+    const int floor_ms = g_frame_pacer.select_floor(requested_fps, timestamp, frequency);
+    *reinterpret_cast<std::int32_t*>(context.ebp - 4U) = floor_ms;
+    g_pacer_selection.cap = requested_fps;
+    g_pacer_selection.floor_ms = floor_ms;
+    g_pacer_selection.qpc_healthy = counter_available && frequency > 0;
+    g_pacer_selection.valid = true;
 }
 
 int __cdecl delta_hook(const int raw_delta) {
     if (InterlockedCompareExchange(&g_runtime_armed, 0, 0) == 0 || g_s2 == nullptr) {
+        g_pacer_selection.valid = false;
         return g_stock_delta == nullptr ? raw_delta : g_stock_delta(raw_delta);
     }
     const auto original = g_s2->original<DeltaFn>();
+    const PacerSelection selection = g_pacer_selection;
+    g_pacer_selection.valid = false;
+    int requested_fps{};
+    if (read_requested_fps(requested_fps)) {
+        LARGE_INTEGER now{};
+        const bool counter_available = QueryPerformanceCounter(&now) != FALSE;
+        const std::int64_t timestamp = counter_available ? now.QuadPart : -1;
+        const std::int64_t frequency = InterlockedCompareExchange64(&g_qpc_frequency, 0, 0);
+        g_frame_pacer.commit(requested_fps, timestamp, frequency);
+        if (selection.valid) {
+            record_pacer_commit(selection.cap, selection.floor_ms,
+                                selection.qpc_healthy && counter_available && frequency > 0);
+        }
+    } else if (InterlockedCompareExchange(&g_maxfps_range_state, 0, 0) >=
+               k_maxfps_range_ready) {
+        mark_permanent_fault("com_maxfps_value_unavailable");
+    }
     if (raw_delta == 0) {
         g_zero_frame_token = 1;
         return 0;
@@ -1660,6 +1961,45 @@ void destroy_candidate(safetyhook::InlineHook* hook) {
     }
 }
 
+bool install_maxfps_range_hook() {
+    if (InterlockedCompareExchange(&g_engine_cap_hook_ready, 0, 0) != 0) {
+        return true;
+    }
+    if (g_maxfps_range_hook != nullptr) {
+        g_reason.store("com_maxfps_range_hook_incomplete", std::memory_order_release);
+        return false;
+    }
+    if (!signature_matches(engine_address(k_engine_cvar_get_range),
+                           k_cvar_get_range_signature)) {
+        g_reason.store("hook_signature_mismatch_cvar_range", std::memory_order_release);
+        return false;
+    }
+
+    HMODULE pinned_patch{};
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                            reinterpret_cast<LPCWSTR>(&__ImageBase), &pinned_patch)) {
+        g_reason.store("patch_pin_failed", std::memory_order_release);
+        return false;
+    }
+    (void)pinned_patch;
+
+    auto result = safetyhook::InlineHook::create(engine_address(k_engine_cvar_get_range),
+                                                 &com_maxfps_range_hook,
+                                                 safetyhook::InlineHook::StartDisabled);
+    auto* const hook = move_to_heap(result);
+    if (hook == nullptr) {
+        g_reason.store("com_maxfps_range_hook_create_failed", std::memory_order_release);
+        return false;
+    }
+    g_maxfps_range_hook = hook;
+    if (!hook->enable().has_value()) {
+        g_reason.store("com_maxfps_range_hook_enable_failed", std::memory_order_release);
+        return false;
+    }
+    InterlockedExchange(&g_engine_cap_hook_ready, 1);
+    return true;
+}
+
 bool detach_cgame_hooks() {
     // VM teardown must not cross the unload boundary while any callback can
     // still return through cgame code. A timeout followed by stock shutdown
@@ -1796,6 +2136,13 @@ bool attach_cgame_hooks() {
 }
 
 bool install_runtime_hooks() {
+    LARGE_INTEGER qpc_frequency{};
+    if (!QueryPerformanceFrequency(&qpc_frequency) || qpc_frequency.QuadPart <= 0) {
+        g_reason.store("qpc_frequency_unavailable", std::memory_order_release);
+        return false;
+    }
+    InterlockedExchange64(&g_qpc_frequency, qpc_frequency.QuadPart);
+
     const auto check_signature = [](const void* address, const auto& expected,
                                     const char* reason) {
         if (signature_matches(address, expected)) {
@@ -2068,27 +2415,43 @@ bool try_install() {
         InterlockedExchange(&g_status, k_stock);
     } else {
         g_engine = GetModuleHandleW(nullptr);
-        g_cgame = GetModuleHandleW(L"cgamex86.dll");
-        if (g_engine == nullptr || g_cgame == nullptr) {
-            g_reason.store("waiting_for_engine_or_cgame", std::memory_order_release);
+        if (g_engine == nullptr) {
+            g_reason.store("waiting_for_engine", std::memory_order_release);
             InterlockedExchange(&g_status, k_waiting_for_modules);
-        } else if (!hash_file(module_path(g_engine), g_engine_hash) ||
-                   !hash_file(module_path(g_cgame), g_cgame_hash)) {
-            g_reason.store("module_hash_read_failed", std::memory_order_release);
+        } else if (InterlockedCompareExchange(&g_engine_cap_hook_ready, 0, 0) == 0 &&
+                   !hash_file(module_path(g_engine), g_engine_hash)) {
+            g_reason.store("engine_hash_read_failed", std::memory_order_release);
             InterlockedExchange(&g_status, k_refused);
-        } else if (!exact_hash(std::string_view(g_engine_hash.data()), k_engine_hash)) {
+        } else if (InterlockedCompareExchange(&g_engine_cap_hook_ready, 0, 0) == 0 &&
+                   !exact_hash(std::string_view(g_engine_hash.data()), k_engine_hash)) {
             g_reason.store("engine_identity_mismatch", std::memory_order_release);
             InterlockedExchange(&g_status, k_refused);
-        } else if (!exact_hash(std::string_view(g_cgame_hash.data()), k_cgame_hash)) {
-            g_reason.store("cgame_identity_mismatch", std::memory_order_release);
+        } else if (InterlockedCompareExchange(&g_engine_cap_hook_ready, 0, 0) == 0 &&
+                   !install_maxfps_range_hook()) {
+            InterlockedExchange(&g_status, k_refused);
+        } else if (InterlockedCompareExchange(&g_maxfps_range_state, 0, 0) ==
+                   k_maxfps_range_failed) {
+            g_reason.store("com_maxfps_range_update_failed", std::memory_order_release);
             InterlockedExchange(&g_status, k_refused);
         } else {
-            InterlockedExchange(&g_status, k_identity_validated);
-            installed = install_runtime_hooks();
-            if (installed) {
-                InterlockedExchange(&g_status, k_runtime_active);
-            } else {
+            g_cgame = GetModuleHandleW(L"cgamex86.dll");
+            if (g_cgame == nullptr) {
+                g_reason.store("waiting_for_cgame", std::memory_order_release);
+                InterlockedExchange(&g_status, k_waiting_for_modules);
+            } else if (!hash_file(module_path(g_cgame), g_cgame_hash)) {
+                g_reason.store("cgame_hash_read_failed", std::memory_order_release);
                 InterlockedExchange(&g_status, k_refused);
+            } else if (!exact_hash(std::string_view(g_cgame_hash.data()), k_cgame_hash)) {
+                g_reason.store("cgame_identity_mismatch", std::memory_order_release);
+                InterlockedExchange(&g_status, k_refused);
+            } else {
+                InterlockedExchange(&g_status, k_identity_validated);
+                installed = install_runtime_hooks();
+                if (installed) {
+                    InterlockedExchange(&g_status, k_runtime_active);
+                } else {
+                    InterlockedExchange(&g_status, k_refused);
+                }
             }
         }
     }
@@ -2144,8 +2507,11 @@ extern "C" BOOL WINAPI ql_patch_bootstrap() noexcept {
         InterlockedExchange(&g_status, k_stock);
         return FALSE;
     }
-    ensure_worker();
     const bool installed = try_install();
+    if (!installed && InterlockedCompareExchange(&g_status, 0, 0) ==
+                          k_waiting_for_modules) {
+        ensure_worker();
+    }
     return installed ? TRUE : FALSE;
 }
 
