@@ -53,6 +53,7 @@ constexpr std::uintptr_t k_engine_time_absolute = 0x01205E30U;
 constexpr std::uintptr_t k_engine_s11_absolute = 0x01528BA4U;
 constexpr std::uintptr_t k_engine_present_absolute = 0x0146CC34U;
 constexpr std::uintptr_t k_engine_com_maxfps = 0x0145CA48U;
+constexpr std::uintptr_t k_engine_cylinder_scale_read = 0x004C66E3U;
 constexpr std::uintptr_t k_cgame_warning_compare = 0x1000AF2EU;
 constexpr std::uintptr_t k_cgame_predict_compare = 0x10044884U;
 constexpr std::uintptr_t k_cgame_warning_entry = 0x1000AEF0U;
@@ -63,6 +64,8 @@ constexpr std::uintptr_t k_cgame_hitreg_feedback = 0x100435CBU;
 constexpr std::uintptr_t k_cgame_hitreg_draw = 0x10009D3BU;
 constexpr std::uintptr_t k_cgame_angle_vectors = 0x10056E40U;
 constexpr std::uintptr_t k_cgame_point_trace = 0x10044040U;
+constexpr std::uintptr_t k_cgame_alternate_point_trace = 0x10044100U;
+constexpr std::uintptr_t k_cgame_trace_mode = 0x10A5FD9CU;
 constexpr std::uintptr_t k_cgame_text_measure = 0x100082B0U;
 constexpr std::uintptr_t k_cgame_text_paint = 0x10008440U;
 constexpr std::uintptr_t k_cgame_client_info_teams = 0x10A41DF8U;
@@ -75,6 +78,8 @@ constexpr std::array<std::uint8_t, 5> k_s1_signature{0xE8, 0x4D, 0xF4, 0xFF, 0xF
 constexpr std::array<std::uint8_t, 16> k_cvar_get_range_signature{
     0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x0C, 0x8B, 0x45,
     0x10, 0x53, 0x56, 0x57, 0x50, 0xFF, 0x15, 0x54};
+constexpr std::array<std::uint8_t, 6> k_cylinder_scale_read_signature{
+    0xD9, 0x40, 0x2C, 0xD8, 0x4D, 0x10};
 constexpr std::array<std::uint8_t, 8> k_s2_signature{
     0x55, 0x8B, 0xEC, 0xA1, 0x50, 0xB9, 0x45, 0x01};
 constexpr std::array<std::uint8_t, 9> k_s3_signature{
@@ -263,6 +268,7 @@ safetyhook::MidHook* g_fps_display{};
 safetyhook::MidHook* g_hitreg_fire{};
 safetyhook::MidHook* g_hitreg_feedback{};
 safetyhook::MidHook* g_hitreg_draw{};
+safetyhook::MidHook* g_client_cylinder_scale{};
 
 SRWLOCK g_history_lock = SRWLOCK_INIT;
 SRWLOCK g_decision_lock = SRWLOCK_INIT;
@@ -293,6 +299,7 @@ __declspec(thread) unsigned char g_zero_frame_token{};
 __declspec(thread) ql1k::FramePacer g_frame_pacer{};
 __declspec(thread) PacerSelection g_pacer_selection{};
 __declspec(thread) ReplayAuthorization g_replay_auth{};
+__declspec(thread) bool g_client_accuracy_trace_active{};
 __declspec(thread) LONG g_s9_token_depth{};
 __declspec(thread) LONG g_module_ticket_depth{};
 
@@ -1722,6 +1729,66 @@ bool native_angle_vectors(const float* angles, float* forward) noexcept {
     return true;
 }
 
+void client_cylinder_scale_hook(safetyhook::Context& context) {
+    if (!g_client_accuracy_trace_active) {
+        return;
+    }
+    // CM_TraceThroughCylinder reads only cvar->value here, then discards EAX.
+    // sv_cylinderScale is not replicated: a client's archived value (often 0)
+    // is not the remote server's hitbox size. Keep the supported game's native
+    // 1.1f reference geometry for this measurement only, without changing the
+    // real cvar, rendered beam, movement, or a locally running server.
+    struct CvarFloatView {
+        std::array<std::uint8_t, 0x2C> prefix{};
+        float value{1.1F};
+    };
+    static constexpr CvarFloatView native_scale{};
+    context.eax = reinterpret_cast<std::uintptr_t>(&native_scale);
+}
+
+bool native_lg_point_trace(
+    std::uint32_t* const result, const float* const start, const float* const end,
+    const std::int32_t skip_entity, const std::int32_t mask) noexcept {
+    const auto* const trace_mode = static_cast<const std::int32_t*>(
+        cgame_address(k_cgame_trace_mode));
+    if (trace_mode == nullptr) {
+        return false;
+    }
+    // CG_LightningBolt 0x10051E4A selects the server's g_playerCylinders
+    // configstring. A box-only trace incorrectly hits cylinder corners.
+    if (*trace_mode != 0) {
+        const auto function = cgame_address(k_cgame_alternate_point_trace);
+        if (function == nullptr) {
+            return false;
+        }
+        // Native 0x10044100 usercall: ECX=result, EDX=start, EBX=end,
+        // followed by stack arguments skip-entity and mask.
+        const bool previous_trace_active = g_client_accuracy_trace_active;
+        g_client_accuracy_trace_active = true;
+        __asm {
+            push ebx
+            mov eax, function
+            mov ecx, result
+            mov edx, start
+            mov ebx, end
+            push mask
+            push skip_entity
+            call eax
+            add esp, 8
+            pop ebx
+        }
+        g_client_accuracy_trace_active = previous_trace_active;
+        return true;
+    }
+    const auto trace = reinterpret_cast<PointTraceFn>(
+        cgame_address(k_cgame_point_trace));
+    if (trace == nullptr) {
+        return false;
+    }
+    trace(result, start, nullptr, nullptr, end, skip_entity, mask);
+    return true;
+}
+
 struct ClientRayResult {
     ql1k::HitregTraceKind kind{ql1k::HitregTraceKind::other};
     std::int32_t entity_number{-1};
@@ -1731,10 +1798,9 @@ struct ClientRayResult {
 
 ClientRayResult trace_native_client_lg_ray(const std::uint8_t* player_state) noexcept {
     ClientRayResult result{};
-    const auto trace = reinterpret_cast<PointTraceFn>(cgame_address(k_cgame_point_trace));
     const auto* const serverinfo_flags =
         static_cast<const std::int32_t*>(cgame_address(k_cgame_serverinfo_flags));
-    if (player_state == nullptr || trace == nullptr || serverinfo_flags == nullptr) {
+    if (player_state == nullptr || serverinfo_flags == nullptr) {
         return result;
     }
     const std::int32_t shooter =
@@ -1768,7 +1834,9 @@ ClientRayResult trace_native_client_lg_ray(const std::uint8_t* player_state) noe
 
     std::array<std::uint32_t, 14> trace_result{};
     const std::int32_t mask = (*serverinfo_flags & 0x02000000) != 0 ? 0x00000001 : 0x06000001;
-    trace(trace_result.data(), start.data(), nullptr, nullptr, end.data(), shooter, mask);
+    if (!native_lg_point_trace(trace_result.data(), start.data(), end.data(), shooter, mask)) {
+        return result;
+    }
     std::memcpy(&result.entity_number,
                 trace_result.data() + k_trace_entity_number_index,
                 sizeof(result.entity_number));
@@ -2187,6 +2255,9 @@ bool install_runtime_hooks() {
         !check_relocated_signature(engine_address(k_engine_present), k_present_signature, 2U,
                                    engine_address(k_engine_present_absolute),
                                    "hook_signature_mismatch_present") ||
+        !check_signature(engine_address(k_engine_cylinder_scale_read),
+                         k_cylinder_scale_read_signature,
+                         "hook_signature_mismatch_cylinder_scale") ||
         !check_relocated_signature(cgame_address(k_cgame_warning_entry),
                                    k_warning_entry_signature, 4U,
                                    cgame_address(k_cgame_warning_absolute),
@@ -2263,6 +2334,9 @@ bool install_runtime_hooks() {
                                                      safetyhook::InlineHook::StartDisabled);
     auto s11_result = safetyhook::InlineHook::create(engine_address(k_engine_s11), &shutdown_hook,
                                                      safetyhook::InlineHook::StartDisabled);
+    auto cylinder_scale_result = safetyhook::MidHook::create(
+        engine_address(k_engine_cylinder_scale_read), &client_cylinder_scale_hook,
+        safetyhook::MidHook::StartDisabled);
     auto warning_entry_result =
         safetyhook::InlineHook::create(cgame_address(k_cgame_warning_entry), &warning_entry_hook,
                                        safetyhook::InlineHook::StartDisabled);
@@ -2297,6 +2371,7 @@ bool install_runtime_hooks() {
     auto* s9_post = move_to_heap(s9_post_result);
     auto* s10 = move_to_heap(s10_result);
     auto* s11 = move_to_heap(s11_result);
+    auto* cylinder_scale = move_to_heap(cylinder_scale_result);
     auto* warning_entry = move_to_heap(warning_entry_result);
     auto* predict_entry = move_to_heap(predict_entry_result);
     auto* warning = move_to_heap(warning_result);
@@ -2307,6 +2382,7 @@ bool install_runtime_hooks() {
     auto* hitreg_draw = move_to_heap(hitreg_draw_result);
     if (s1 == nullptr || s2 == nullptr || s3 == nullptr || s4 == nullptr || s8 == nullptr ||
         s9_pre == nullptr || s9_post == nullptr || s10 == nullptr || s11 == nullptr ||
+        cylinder_scale == nullptr ||
         warning_entry == nullptr || predict_entry == nullptr || warning == nullptr ||
         predict == nullptr || fps == nullptr || hitreg_fire == nullptr ||
         hitreg_feedback == nullptr || hitreg_draw == nullptr) {
@@ -2319,6 +2395,7 @@ bool install_runtime_hooks() {
         destroy_candidate(s9_post);
         destroy_candidate(s10);
         destroy_candidate(s11);
+        destroy_candidate(cylinder_scale);
         destroy_candidate(warning_entry);
         destroy_candidate(predict_entry);
         destroy_candidate(warning);
@@ -2340,6 +2417,7 @@ bool install_runtime_hooks() {
     g_s9_post = s9_post;
     g_s10 = s10;
     g_s11 = s11;
+    g_client_cylinder_scale = cylinder_scale;
     g_warning_entry = warning_entry;
     g_predict_entry = predict_entry;
     g_warning = warning;
@@ -2367,6 +2445,7 @@ bool install_runtime_hooks() {
     const bool e9_post = s9_post->enable().has_value();
     const bool e10 = s10->enable().has_value();
     const bool e11 = s11->enable().has_value();
+    const bool e_cylinder_scale = cylinder_scale->enable().has_value();
     const bool e_warning_entry = warning_entry->enable().has_value();
     const bool e_predict_entry = predict_entry->enable().has_value();
     const bool e_warning = warning->enable().has_value();
@@ -2377,7 +2456,7 @@ bool install_runtime_hooks() {
     const bool e_hitreg_draw = hitreg_draw->enable().has_value();
     const bool enabled = e1 && e2 && e3 && e4 && e8 && e9_pre && e9_post && e10 && e11 &&
                          e_warning_entry && e_predict_entry && e_warning && e_predict && e_fps &&
-                         e_hitreg_fire && e_hitreg_feedback && e_hitreg_draw;
+                         e_hitreg_fire && e_hitreg_feedback && e_hitreg_draw && e_cylinder_scale;
     if (!enabled) {
         InterlockedExchange(&g_runtime_armed, 0);
         // Keep any partially enabled hooks resident for process life. All

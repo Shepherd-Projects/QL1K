@@ -52,6 +52,10 @@ With `cg_drawFPS 1`, QL1K also shows `client accuracy N.NN%` below the FPS count
 
 This is a client-side hitreg indicator: client-side opponent contacts divided by native LG fire opportunities. It is useful for seeing what your client predicted, but it is not the server's official hit count, damage, or weapon-stat accuracy.
 
+Contacts use Quake Live's native point trace, native entity bounds and interpolated positions, world obstruction, and server-selected `g_playerCylinders` mode. Each native LG fire event contributes one sample; server hit feedback does not supply the client hit count. Beam width does not enlarge the trace.
+
+For cylinder contacts, this measurement uses the supported game's native default body scale of `1.1`. The local `sv_cylinderScale` cvar is not replicated by the server: an archived client value such as `0` must not collapse the measured body radius. This measurement-only correction leaves your cvar, normal game traces, rendered beam, FPS pacing, and any local server unchanged. A remote server's undisclosed custom cylinder scale cannot be inferred by the client, so this indicator is a native-default reference, not a guarantee for custom collision settings.
+
 ## Common install issues
 
 - **Antivirus warning:** QL1K uses an unsigned DLL and injector, which some security products may quarantine. A warning is not automatically safe or malicious. Download only from this repository, review the source and `SHA256SUMS.txt`, and allow or restore only the exact QL1K files if you trust them. Do not disable antivirus protection globally. After a quarantine, extract a fresh ZIP before retrying.
