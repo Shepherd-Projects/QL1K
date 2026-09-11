@@ -9,7 +9,7 @@ The FPS value is a ceiling, not a guarantee: the rate you actually reach still d
 Requirements: Windows, Quake Live on Steam, and PowerShell 5.1 or newer. QL1K supports one exact game build and stops safely when the game files are unknown.
 
 1. Close Quake Live completely.
-2. [Download the current `main` ZIP](https://github.com/Shepherd-Projects/QL1K/archive/refs/heads/main.zip) and extract it to a new folder, or clone this repository.
+2. [Download the tested accuracy-fix ZIP (`c31d565`)](https://github.com/Shepherd-Projects/QL1K/archive/c31d56566fe47e601c5d5ce0e02dbdc9be5b7fa3.zip) and extract it to a **new folder**. This version-specific link contains the corrected DLL and installer; no build tools are required.
 3. Open PowerShell in that folder and run:
 
 ```powershell
@@ -26,6 +26,18 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1 `
 The installer verifies the packaged files, copies them into Quake Live, verifies them again, and creates a **QL1K** desktop shortcut. It does not edit `autoexec.cfg`, `qzconfig.cfg`, or your other game settings.
 
 Always start the game with the **QL1K** shortcut. Steam's normal Play button does not load the patch.
+
+### Updating an older installation
+
+Downloading or extracting a ZIP does **not** update the installed patch. Close Quake Live, run `install.ps1` from the newly extracted folder, and then start the game with the **QL1K** shortcut. Do not run an installer from an older `QL1K-main` folder. Existing installations do not update automatically.
+
+The tested build above is commit `c31d565`. Its `ql_fps_patch.dll` SHA-256 is:
+
+```text
+AF0A92F0AE43AD5A22EC7A17A4201D4354EB198794D71666119AFE5FA74D3BF4
+```
+
+The installer prints the installed DLL checksum. It must match the value above for this build. The download link is pinned to this tested version; developers who want the changing source branch can [browse `main`](https://github.com/Shepherd-Projects/QL1K/tree/main) instead.
 
 ## Set your FPS cap
 
